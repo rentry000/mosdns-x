@@ -85,7 +85,7 @@ func tryCreateWatchCert[T tls.Certificate | eTLS.Certificate](certFile string, k
 	return cc, nil
 }
 
-func (s *Server) CreateQUICListner(conn net.PacketConn, nextProtos []string) (*quic.EarlyListener, error) {
+func (s *Server) CreateQUICListner(conn net.PacketConn, nextProtos []string, allowedSNI string) (*quic.EarlyListener, error) {
 	if s.opts.Cert == "" || s.opts.Key == "" {
 		return nil, errors.New("missing certificate for tls listener")
 	}
@@ -96,6 +96,10 @@ func (s *Server) CreateQUICListner(conn net.PacketConn, nextProtos []string) (*q
 	return quic.ListenEarly(conn, &tls.Config{
 		NextProtos: nextProtos,
 		GetCertificate: func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+            // 增加 SNI 校验逻辑
+			if allowedSNI != "" && chi.ServerName != allowedSNI {
+				return nil, errors.New("invalid sni")
+			}
 			return c.c, nil
 		},
 	}, &quic.Config{
@@ -107,7 +111,7 @@ func (s *Server) CreateQUICListner(conn net.PacketConn, nextProtos []string) (*q
 	})
 }
 
-func (s *Server) CreateETLSListner(l net.Listener, nextProtos []string) (net.Listener, error) {
+func (s *Server) CreateETLSListner(l net.Listener, nextProtos []string, allowedSNI string) (net.Listener, error) {
 	if s.opts.Cert == "" || s.opts.Key == "" {
 		return nil, errors.New("missing certificate for tls listener")
 	}
@@ -125,7 +129,11 @@ func (s *Server) CreateETLSListner(l net.Listener, nextProtos []string) (net.Lis
 			AllSecureCipherSuites: true,
 			AllSecureCurves: true,
 		},
-		GetCertificate: func(_ *eTLS.ClientHelloInfo) (*eTLS.Certificate, error) {
+		GetCertificate: func(chi *eTLS.ClientHelloInfo) (*eTLS.Certificate, error) {
+			// 增加 SNI 校验逻辑
+			if allowedSNI != "" && chi.ServerName != allowedSNI {
+				return nil, errors.New("invalid sni")
+			}
 			return c.c, nil
 		},
 	}), nil

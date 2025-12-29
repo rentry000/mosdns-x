@@ -85,6 +85,7 @@ type ServerListenerConfig struct {
 	ProxyProtocol       bool   `yaml:"proxy_protocol"`          // accepting the PROXYProtocol
 
 	IdleTimeout uint `yaml:"idle_timeout"` // (sec) used by tcp, dot, doh as connection idle timeout.
+	AllowedSNI  string `yaml:"allowed_sni"` // 只允许指定的SNI访问
 }
 
 type APIConfig struct {
