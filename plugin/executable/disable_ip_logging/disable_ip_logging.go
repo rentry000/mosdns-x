@@ -17,16 +17,15 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-
 package disable_ip_logging
 
 import (
 	"context"
 	"net/netip"
 
-  "github.com/bibicadotnet/mosdns-x/coremain"
-  "github.com/bibicadotnet/mosdns-x/pkg/executable_seq"
-  "github.com/bibicadotnet/mosdns-x/pkg/query_context"
+	"github.com/bibicadotnet/mosdns-x/coremain"
+	"github.com/bibicadotnet/mosdns-x/pkg/executable_seq"
+	"github.com/bibicadotnet/mosdns-x/pkg/query_context"
 )
 
 const PluginType = "disable_ip_logging"
