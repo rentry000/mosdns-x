@@ -46,5 +46,4 @@ import (
 	_ "github.com/pmkol/mosdns-x/plugin/executable/ttl"
 	_ "github.com/pmkol/mosdns-x/plugin/matcher/query_matcher"
 	_ "github.com/pmkol/mosdns-x/plugin/matcher/response_matcher"
-	_ "github.com/pmkol/mosdns-x/plugin/executable/disable_ip_logging"
 )
