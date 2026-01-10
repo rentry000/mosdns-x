@@ -90,6 +90,8 @@ func (m *Mosdns) startServerListener(cfg *ServerListenerConfig, dnsHandler D.Han
 	httpHandler, err := H.NewHandler(H.HandlerOpts{
 		DNSHandler:  dnsHandler,
 		Path:        cfg.URLPath,
+		HealthPath:  cfg.HealthPath,
+		RedirectURL: cfg.RedirectURL,
 		SrcIPHeader: cfg.GetUserIPFromHeader,
 		Logger:      m.logger,
 	})
