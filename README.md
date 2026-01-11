@@ -2,7 +2,7 @@
 
 Mosdns-x is a high-performance DNS forwarder written in Go. It features a plugin pipeline architecture, allowing users to customize DNS processing logic for any specific use case.
 
-This version is a fork based on [pmkol/mosdns-x](https://github.com/pmkol/mosdns-x), focusing on privacy enhancements and connection resilience.
+This version is a fork based on [pmkol/mosdns-x](https://github.com/pmkol/mosdns-x) and incorporates significant improvements and commits from [BaeKey/mosdns-x](https://github.com/BaeKey/mosdns-x), with a primary focus on privacy and connection resilience.
 
 **Supported Protocols (Inbound & Outbound):**
 
@@ -42,5 +42,6 @@ For features, configuration guides, and tutorials, visit the [Wiki](https://gith
 ### Related Projects
 
 * **[pmkol/mosdns-x](https://github.com/pmkol/mosdns-x):** The base project for this high-performance DNS forwarder.
+* **[BaeKey/mosdns-x](https://github.com/BaeKey/mosdns-x):** Key contributor to the enhanced features and logic implemented in this version.
 * **[easymosdns](https://github.com/pmkol/easymosdns):** A Linux helper script to deploy ECS-supported, clean DNS servers quickly.
 * **[mosdns-v4](https://github.com/IrineSistiana/mosdns/tree/v4):** The upstream project providing the modular plugin-based forwarder architecture.
