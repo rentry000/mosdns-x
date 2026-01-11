@@ -133,7 +133,14 @@ func (s *Server) CreateQUICListner(conn net.PacketConn, nextProtos []string, all
 	if err != nil {
 		return nil, err
 	}
-	return quic.ListenEarly(conn, &tls.Config{
+	
+	// Create Transport with StatelessResetKey
+	tr := &quic.Transport{
+		Conn:              conn,
+		StatelessResetKey: statelessResetKey,
+	}
+	
+	return tr.ListenEarly(&tls.Config{
 		NextProtos: nextProtos,
 		GetCertificate: func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			if allowedSNI != "" && chi.ServerName != allowedSNI {
@@ -142,7 +149,6 @@ func (s *Server) CreateQUICListner(conn net.PacketConn, nextProtos []string, all
 			return c.c, nil
 		},
 	}, &quic.Config{
-		StatelessResetKey:              statelessResetKey,
 		Allow0RTT:                      true,
 		InitialStreamReceiveWindow:     1252,
 		MaxStreamReceiveWindow:         4 * 1024,
