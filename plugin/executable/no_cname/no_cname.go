@@ -47,20 +47,25 @@ func (t *noCNAME) Exec(ctx context.Context, qCtx *query_context.Context, next ex
 	if err := executable_seq.ExecChainNode(ctx, qCtx, next); err != nil {
 		return err
 	}
-
 	r := qCtx.R()
 	if r == nil {
 		return nil
 	}
-
-	rr := r.Answer[:0]
+	
+	if len(r.Question) == 0 {
+		return nil
+	}
+	originalName := r.Question[0].Name
+	
+	rr := make([]dns.RR, 0, len(r.Answer))
 	for _, ar := range r.Answer {
 		if ar.Header().Rrtype == dns.TypeCNAME {
 			continue
 		}
-		rr = append(rr, ar)
+		newRR := dns.Copy(ar)
+		newRR.Header().Name = originalName
+		rr = append(rr, newRR)
 	}
 	r.Answer = rr
-
 	return nil
 }
