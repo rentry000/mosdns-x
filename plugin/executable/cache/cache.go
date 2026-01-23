@@ -209,6 +209,20 @@ func (c *cachePlugin) getMsgKey(q *dns.Msg) (string, error) {
 		}
 		return msgKey, nil
 	}
+
+	if len(q.Question) == 1 {
+		simpleQ := *q
+		simpleQ.Answer = nil
+		simpleQ.Ns = nil
+		simpleQ.Extra = nil
+
+		msgKey, err := dnsutils.GetMsgKey(&simpleQ, 0)
+		if err != nil {
+			return "", fmt.Errorf("failed to unpack query msg, %w", err)
+		}
+		return msgKey, nil
+	}
+
 	return "", nil
 }
 
