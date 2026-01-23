@@ -22,6 +22,7 @@ package bundled_upstream
 import (
 	"context"
 	"errors"
+	"sync"
 
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
@@ -31,12 +32,9 @@ import (
 
 type Upstream interface {
 	// Exchange sends q to the upstream and waits for response.
-	// If any error occurs. Implements must return a nil msg with a non nil error.
-	// Otherwise, Implements must a msg with nil error.
 	Exchange(ctx context.Context, q *dns.Msg) (*dns.Msg, error)
 
 	// Trusted indicates whether this Upstream is trusted/reliable.
-	// If true, responses from this Upstream will be accepted without checking its rcode.
 	Trusted() bool
 
 	Address() string
@@ -57,46 +55,85 @@ func ExchangeParallel(ctx context.Context, qCtx *query_context.Context, upstream
 		logger = nopLogger
 	}
 
-	q := qCtx.Q()
 	t := len(upstreams)
+	if t == 0 {
+		return nil, ErrAllFailed
+	}
+
+	q := qCtx.Q()
 	if t == 1 {
 		return upstreams[0].Exchange(ctx, q)
 	}
 
-	c := make(chan *parallelResult, t) // use buf chan to avoid blocking.
-	qCopy := q.Copy()                  // qCtx is not safe for concurrent use.
+	taskCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	c := make(chan *parallelResult, t)
+
 	for _, u := range upstreams {
 		u := u
+		qCopy := q.Copy()
+
+		wg.Add(1)
 		go func() {
-			r, err := u.Exchange(ctx, qCopy)
-			c <- &parallelResult{
-				r:    r,
-				err:  err,
-				from: u,
+			defer wg.Done()
+			r, err := u.Exchange(taskCtx, qCopy)
+			select {
+			case c <- &parallelResult{r: r, err: err, from: u}:
+			case <-taskCtx.Done():
+				return
 			}
 		}()
 	}
 
-	for i := 0; i < t; i++ {
-		select {
-		case res := <-c:
-			if res.err != nil {
-				logger.Warn("upstream err", qCtx.InfoField(), zap.String("addr", res.from.Address()))
-				continue
-			}
+	go func() {
+		wg.Wait()
+		close(c)
+	}()
 
-			if res.r == nil {
-				continue
-			}
+	var lastRes *dns.Msg
+	var lastErr error
 
-			if res.from.Trusted() || res.r.Rcode == dns.RcodeSuccess {
-				return res.r, nil
+	// Idiomatic way to consume the channel until it's closed by the waiter goroutine
+	for res := range c {
+		if res.err != nil {
+			// Suppress logging for context cancellation as it is an expected behavior
+			if !errors.Is(res.err, context.Canceled) {
+				logger.Warn("upstream failed",
+					qCtx.InfoField(),
+					zap.String("addr", res.from.Address()),
+					zap.Error(res.err))
+				lastErr = res.err
 			}
 			continue
+		}
 
-		case <-ctx.Done():
-			return nil, ctx.Err()
+		if res.r == nil {
+			continue
+		}
+
+		// Priority 1: Trusted upstream or Successful Rcode (0)
+		if res.from.Trusted() || res.r.Rcode == dns.RcodeSuccess {
+			cancel()
+			return res.r, nil
+		}
+
+		// Priority 2: Prefer NXDOMAIN (NameError) over other Rcode errors
+		if lastRes == nil || (res.r.Rcode == dns.RcodeNameError && lastRes.Rcode != dns.RcodeNameError) {
+			lastRes = res.r
 		}
 	}
+
+	// Fallback to the best non-success response found (e.g., NXDOMAIN)
+	if lastRes != nil {
+		return lastRes, nil
+	}
+
+	// If everything failed, return the last meaningful error
+	if lastErr != nil && !errors.Is(lastErr, context.Canceled) {
+		return nil, lastErr
+	}
+
 	return nil, ErrAllFailed
 }
