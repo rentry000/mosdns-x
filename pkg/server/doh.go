@@ -41,8 +41,8 @@ const (
 	// Timeout for writing response to client
 	defaultWriteTimeout = 10 * time.Second
 	
-	// Maximum size of request headers (4KB is standard for most web servers)
-	defaultMaxHeaderBytes = 4096
+	// Maximum size of request headers (2KB is sufficient for DNS-over-HTTPS)
+	defaultMaxHeaderBytes = 2048
 )
 
 func (s *Server) ServeHTTP(l net.Listener) error {
@@ -78,7 +78,7 @@ func (s *Server) ServeHTTP(l net.Listener) error {
 		IdleTimeout: idleTimeout,
 		
 		// MaxHeaderBytes: Maximum size of request headers
-		// 4KB is sufficient for DNS-over-HTTPS and standard HTTP headers
+		// 2KB is sufficient for DNS-over-HTTPS
 		MaxHeaderBytes: defaultMaxHeaderBytes,
 	}
 	
