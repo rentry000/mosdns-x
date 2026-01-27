@@ -207,8 +207,6 @@ func (c *cachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, nex
 	return err
 }
 
-// getMsgKey returns a string key for the query msg, or an empty
-// string if query should not be cached.
 func (c *cachePlugin) getMsgKey(q *dns.Msg) (string, error) {
 	isSimpleQuery := len(q.Question) == 1 && len(q.Answer) == 0 && len(q.Ns) == 0 && len(q.Extra) == 0
 	if isSimpleQuery || c.args.CacheEverything {
@@ -235,13 +233,9 @@ func (c *cachePlugin) getMsgKey(q *dns.Msg) (string, error) {
 	return "", nil
 }
 
-// lookupCache returns the cached response. The ttl of returned msg will be changed properly.
-// Remember, caller must change the msg id.
 func (c *cachePlugin) lookupCache(msgKey string) (r *dns.Msg, lazyHit bool, err error) {
-	// lookup in cache
 	v, storedTime, _ := c.backend.Get(msgKey)
 
-	// cache hit
 	if v != nil {
 		if c.args.CompressResp {
 			decodeLen, err := snappy.DecodedLen(v)
@@ -271,32 +265,23 @@ func (c *cachePlugin) lookupCache(msgKey string) (r *dns.Msg, lazyHit bool, err 
 			msgTTL = time.Duration(dnsutils.GetMinimalTTL(r)) * time.Second
 		}
 
-		// not expired
 		if storedTime.Add(msgTTL).After(time.Now()) {
 			dnsutils.SubtractTTL(r, uint32(time.Since(storedTime).Seconds()))
 			return r, false, nil
 		}
 
-		// expired but lazy update enabled
 		if c.args.LazyCacheTTL > 0 {
-			// set the default ttl
 			dnsutils.SetTTL(r, uint32(c.args.LazyCacheReplyTTL))
 			return r, true, nil
 		}
 	}
 
-	// cache miss
 	return nil, false, nil
 }
 
-// doLazyUpdate starts a new goroutine to execute next node and update the cache in the background.
-// It has an inner singleflight.Group to de-duplicate same msgKey.
 func (c *cachePlugin) doLazyUpdate(ctx context.Context, msgKey string, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) {
+	// Q is already deep copied by qCtx.Copy()
 	lazyQCtx := qCtx.Copy()
-	q := lazyQCtx.Q()
-	if q != nil {
-		*q = *(qCtx.Q().Copy())
-	}
 
 	go func() {
 		_, _, _ = c.lazyUpdateSF.Do(msgKey, func() (interface{}, error) {
@@ -329,7 +314,6 @@ func (c *cachePlugin) doLazyUpdate(ctx context.Context, msgKey string, qCtx *que
 	}()
 }
 
-// tryStoreMsg tries to store r to cache. If r should be cached.
 func (c *cachePlugin) tryStoreMsg(key string, r *dns.Msg) error {
 	if r.Truncated {
 		return nil
