@@ -232,9 +232,12 @@ func (c *cachePlugin) doLazyUpdate(
 	qCtx *query_context.Context,
 	next executable_seq.ExecutableChainNode,
 ) {
-	lazyQCtx := qCtx.Copy()
+	// Deep copy the DNS question message
 	qCopy := qCtx.Q().Copy()
-	lazyQCtx.QCtx = qCopy 
+	
+	// Create a completely new query context with the copied message
+	// This avoids accessing undefined internal fields of the struct
+	lazyQCtx := query_context.NewContext(qCopy)
 
 	go func() {
 		_, _, _ = c.lazyUpdateSF.Do(key, func() (interface{}, error) {
