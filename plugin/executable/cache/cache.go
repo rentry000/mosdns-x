@@ -193,7 +193,6 @@ func (c *cachePlugin) lookupCache(key string) (*dns.Msg, bool, error) {
 	}
 
 	if c.args.CompressResp {
-		// Dùng pool buffer để giải nén cho tối ưu
 		buf := pool.GetBuf(dns.MaxMsgSize)
 		defer buf.Release()
 		decoded, err := snappy.Decode(buf.Bytes(), v)
@@ -233,20 +232,12 @@ func (c *cachePlugin) doLazyUpdate(
 	qCtx *query_context.Context,
 	next executable_seq.ExecutableChainNode,
 ) {
-	// 1. SHALLOW copy context để lấy các meta-data
 	lazyQCtx := qCtx.Copy()
-
-	// 2. DEEP copy DNS message để luồng chạy ngầm không làm hỏng data luồng chính
 	qCopy := qCtx.Q().Copy()
-	lazyQCtx.SetQuery(qCopy)
+	lazyQCtx.QCtx = qCopy 
 
 	go func() {
 		_, _, _ = c.lazyUpdateSF.Do(key, func() (interface{}, error) {
-			// Quan trọng: Không Forget key ở đây để các query trùng lặp khác 
-			// trong lúc đang update không tạo thêm goroutine mới. 
-			// SF sẽ tự dọn khi kết thúc Do.
-			
-			// Detached context: Tránh việc bị cancel theo request chính
 			ctx, cancel := context.WithTimeout(context.Background(), defaultLazyUpdateTimeout)
 			defer cancel()
 			ctx = context.WithValue(ctx, "mosdns_is_bg_update", true)
@@ -288,11 +279,9 @@ func (c *cachePlugin) tryStoreMsg(key string, r *dns.Msg) error {
 	}
 
 	if c.args.CompressResp {
-		// Dùng pool buffer để nén, tránh tạo rác (garbage collection)
 		buf := pool.GetBuf(snappy.MaxEncodedLen(len(raw)))
 		defer buf.Release()
 		encoded := snappy.Encode(buf.Bytes(), raw)
-		// Phải copy dữ liệu từ buffer ra trước khi release buffer về pool
 		raw = append([]byte(nil), encoded...)
 	}
 
