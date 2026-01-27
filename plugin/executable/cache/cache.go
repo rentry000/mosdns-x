@@ -72,6 +72,7 @@ type cachePlugin struct {
 	size         prometheus.GaugeFunc
 }
 
+// detachedContext preserves Values from parent but ignores parent's cancellation.
 type detachedContext struct {
 	context.Context
 	parentValues context.Context
@@ -221,7 +222,6 @@ func (c *cachePlugin) getMsgKey(q *dns.Msg) (string, error) {
 
 func (c *cachePlugin) lookupCache(msgKey string) (r *dns.Msg, lazyHit bool, err error) {
 	v, storedTime, _ := c.backend.Get(msgKey)
-
 	if v != nil {
 		if c.args.CompressResp {
 			decodeLen, err := snappy.DecodedLen(v)
@@ -229,7 +229,7 @@ func (c *cachePlugin) lookupCache(msgKey string) (r *dns.Msg, lazyHit bool, err 
 				return nil, false, fmt.Errorf("snappy decode err: %w", err)
 			}
 			if decodeLen > dns.MaxMsgSize {
-				return nil, false, fmt.Errorf("invalid snappy data, not a dns msg, data len: %d", decodeLen)
+				return nil, false, fmt.Errorf("invalid snappy data, data len: %d", decodeLen)
 			}
 			decompressBuf := pool.GetBuf(decodeLen)
 			defer decompressBuf.Release()
@@ -260,16 +260,15 @@ func (c *cachePlugin) lookupCache(msgKey string) (r *dns.Msg, lazyHit bool, err 
 			return r, true, nil
 		}
 	}
-
 	return nil, false, nil
 }
 
 func (c *cachePlugin) doLazyUpdate(originalCtx context.Context, msgKey string, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) {
 	lazyQCtx := qCtx.Copy()
 	lazyUpdateFunc := func() (interface{}, error) {
-		c.L().Debug("start lazy cache update", lazyQCtx.InfoField())
 		defer c.lazyUpdateSF.Forget(msgKey)
 
+		// DETACH: Create a background context that keeps Values but ignores parent's cancel.
 		detached := &detachedContext{
 			Context:      context.Background(),
 			parentValues: originalCtx,
@@ -282,16 +281,16 @@ func (c *cachePlugin) doLazyUpdate(originalCtx context.Context, msgKey string, q
 
 		err := executable_seq.ExecChainNode(lazyCtx, lazyQCtx, next)
 		if err != nil {
-			c.L().Warn("failed to update lazy cache", lazyQCtx.InfoField(), zap.Error(err))
+			c.L().Warn("lazy cache update failed silently", lazyQCtx.InfoField(), zap.Error(err))
+			return nil, nil // Return nil error to singleflight to stop error propagation to waiters
 		}
 
 		r := lazyQCtx.R()
 		if r != nil {
 			if err := c.tryStoreMsg(msgKey, r); err != nil {
-				c.L().Error("cache store", qCtx.InfoField(), zap.Error(err))
+				c.L().Error("cache store failed in background", lazyQCtx.InfoField(), zap.Error(err))
 			}
 		}
-		c.L().Debug("lazy cache updated", lazyQCtx.InfoField())
 		return nil, nil
 	}
 	c.lazyUpdateSF.DoChan(msgKey, lazyUpdateFunc)
