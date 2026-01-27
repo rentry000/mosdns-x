@@ -195,6 +195,7 @@ func (c *cachePlugin) lookupCache(key string) (*dns.Msg, bool, error) {
 	if c.args.CompressResp {
 		buf := pool.GetBuf(dns.MaxMsgSize)
 		defer buf.Release()
+
 		decoded, err := snappy.Decode(buf.Bytes(), v)
 		if err != nil {
 			return nil, false, err
@@ -232,17 +233,17 @@ func (c *cachePlugin) doLazyUpdate(
 	qCtx *query_context.Context,
 	next executable_seq.ExecutableChainNode,
 ) {
-	// Deep copy the DNS question message
-	qCopy := qCtx.Q().Copy()
-	
-	// Create a completely new query context with the copied message
-	// This avoids accessing undefined internal fields of the struct
-	lazyQCtx := query_context.NewContext(qCopy)
+	// mosdns đảm bảo Copy() tạo context + dns.Msg riêng
+	lazyQCtx := qCtx.Copy()
 
 	go func() {
 		_, _, _ = c.lazyUpdateSF.Do(key, func() (interface{}, error) {
-			ctx, cancel := context.WithTimeout(context.Background(), defaultLazyUpdateTimeout)
+			ctx, cancel := context.WithTimeout(
+				context.Background(),
+				defaultLazyUpdateTimeout,
+			)
 			defer cancel()
+
 			ctx = context.WithValue(ctx, "mosdns_is_bg_update", true)
 
 			_ = executable_seq.ExecChainNode(ctx, lazyQCtx, next)
@@ -284,6 +285,7 @@ func (c *cachePlugin) tryStoreMsg(key string, r *dns.Msg) error {
 	if c.args.CompressResp {
 		buf := pool.GetBuf(snappy.MaxEncodedLen(len(raw)))
 		defer buf.Release()
+
 		encoded := snappy.Encode(buf.Bytes(), raw)
 		raw = append([]byte(nil), encoded...)
 	}
