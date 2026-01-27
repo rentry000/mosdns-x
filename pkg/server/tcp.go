@@ -116,7 +116,11 @@ func (s *Server) handleConnectionTcp(ctx context.Context, c *TCPConn) {
 		defer cancel()
 
 		if err := tlsConn.HandshakeContext(handshakeCtx); err != nil {
-			s.opts.Logger.Warn("handshake failed", zap.Stringer("from", c.RemoteAddr()), zap.Error(err))
+			if err.Error() == "EOF" {
+				s.opts.Logger.Debug("handshake failed", zap.Stringer("from", c.RemoteAddr()), zap.Error(err))
+			} else {
+				s.opts.Logger.Warn("handshake failed", zap.Stringer("from", c.RemoteAddr()), zap.Error(err))
+			}
 			return
 		}
 
