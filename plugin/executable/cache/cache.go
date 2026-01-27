@@ -15,7 +15,6 @@ import (
 	"github.com/golang/snappy"
 	"github.com/miekg/dns"
 	"github.com/prometheus/client_golang/prometheus"
-	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
 
 	"github.com/pmkol/mosdns-x/coremain"
@@ -24,7 +23,6 @@ import (
 	"github.com/pmkol/mosdns-x/pkg/cache/redis_cache"
 	"github.com/pmkol/mosdns-x/pkg/dnsutils"
 	"github.com/pmkol/mosdns-x/pkg/executable_seq"
-	"github.com/pmkol/mosdns-x/pkg/pool"
 	"github.com/pmkol/mosdns-x/pkg/query_context"
 )
 
@@ -52,8 +50,9 @@ type cachePlugin struct {
 	*coremain.BP
 	args *Args
 
-	whenHit      executable_seq.Executable
-	backend      cache.Backend
+	whenHit executable_seq.Executable
+	backend cache.Backend
+
 	lazyUpdateSF singleflight.Group
 
 	queryTotal   prometheus.Counter
@@ -76,6 +75,7 @@ func newCachePlugin(bp *coremain.BP, args *Args) (*cachePlugin, error) {
 		}
 		opt.MaxRetries = -1
 		r := redis.NewClient(opt)
+
 		backend, err = redis_cache.NewRedisCache(redis_cache.RedisCacheOpts{
 			Client:        r,
 			ClientCloser:  r,
@@ -107,28 +107,21 @@ func newCachePlugin(bp *coremain.BP, args *Args) (*cachePlugin, error) {
 		whenHit: whenHit,
 		backend: backend,
 
-		queryTotal: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "query_total",
-			Help: "Total queries",
-		}),
-		hitTotal: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "hit_total",
-			Help: "Cache hits",
-		}),
-		lazyHitTotal: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "lazy_hit_total",
-			Help: "Lazy cache hits",
-		}),
+		queryTotal:   prometheus.NewCounter(prometheus.CounterOpts{Name: "query_total"}),
+		hitTotal:     prometheus.NewCounter(prometheus.CounterOpts{Name: "hit_total"}),
+		lazyHitTotal: prometheus.NewCounter(prometheus.CounterOpts{Name: "lazy_hit_total"}),
 		size: prometheus.NewGaugeFunc(prometheus.GaugeOpts{
 			Name: "cache_size",
-			Help: "Cache size",
 		}, func() float64 {
 			return float64(backend.Len())
 		}),
 	}
 
 	bp.GetMetricsReg().MustRegister(
-		p.queryTotal, p.hitTotal, p.lazyHitTotal, p.size,
+		p.queryTotal,
+		p.hitTotal,
+		p.lazyHitTotal,
+		p.size,
 	)
 
 	return p, nil
@@ -151,7 +144,7 @@ func (c *cachePlugin) Exec(
 	cached, lazyHit, _ := c.lookupCache(msgKey)
 	if lazyHit {
 		c.lazyHitTotal.Inc()
-		c.doLazyUpdate(ctx, msgKey, qCtx, next)
+		c.doLazyUpdate(msgKey, qCtx, next)
 	}
 
 	if cached != nil {
@@ -170,10 +163,6 @@ func (c *cachePlugin) Exec(
 	}
 	return err
 }
-
-/* =========================
-   CACHE KEY
-========================= */
 
 func (c *cachePlugin) getMsgKey(q *dns.Msg) (string, error) {
 	isSimple := len(q.Question) == 1 &&
@@ -196,10 +185,6 @@ func (c *cachePlugin) getMsgKey(q *dns.Msg) (string, error) {
 	return "", nil
 }
 
-/* =========================
-   LOOKUP
-========================= */
-
 func (c *cachePlugin) lookupCache(key string) (*dns.Msg, bool, error) {
 	v, stored, _ := c.backend.Get(key)
 	if v == nil {
@@ -207,9 +192,7 @@ func (c *cachePlugin) lookupCache(key string) (*dns.Msg, bool, error) {
 	}
 
 	if c.args.CompressResp {
-		buf := pool.GetBuf(dns.MaxMsgSize)
-		defer buf.Release()
-		decoded, err := snappy.Decode(buf.Bytes(), v)
+		decoded, err := snappy.Decode(nil, v)
 		if err != nil {
 			return nil, false, err
 		}
@@ -241,21 +224,20 @@ func (c *cachePlugin) lookupCache(key string) (*dns.Msg, bool, error) {
 	return nil, false, nil
 }
 
-/* =========================
-   LAZY UPDATE (FIXED)
-========================= */
-
 func (c *cachePlugin) doLazyUpdate(
-	origCtx context.Context,
 	key string,
 	qCtx *query_context.Context,
 	next executable_seq.ExecutableChainNode,
 ) {
+	// SHALLOW copy context
+	lazyQCtx := qCtx.Copy()
+
+	// DEEP copy DNS message
 	qCopy := qCtx.Q().Copy()
-	lazyQCtx := qCtx.NewWithQ(qCopy)
+	lazyQCtx.SetQuery(qCopy)
 
 	go func() {
-		c.lazyUpdateSF.Do(key, func() (interface{}, error) {
+		_, _, _ = c.lazyUpdateSF.Do(key, func() (interface{}, error) {
 			ctx, cancel := context.WithTimeout(context.Background(), defaultLazyUpdateTimeout)
 			defer cancel()
 			ctx = context.WithValue(ctx, "mosdns_is_bg_update", true)
@@ -269,10 +251,6 @@ func (c *cachePlugin) doLazyUpdate(
 		})
 	}()
 }
-
-/* =========================
-   STORE (FIXED)
-========================= */
 
 func (c *cachePlugin) tryStoreMsg(key string, r *dns.Msg) error {
 	if r.Truncated {
@@ -301,9 +279,8 @@ func (c *cachePlugin) tryStoreMsg(key string, r *dns.Msg) error {
 	}
 
 	if c.args.CompressResp {
-		buf := make([]byte, snappy.MaxEncodedLen(len(raw)))
-		n := snappy.Encode(buf, raw)
-		raw = append([]byte(nil), n...)
+		encoded := snappy.Encode(nil, raw)
+		raw = encoded
 	}
 
 	c.backend.Store(key, raw, now, exp)
