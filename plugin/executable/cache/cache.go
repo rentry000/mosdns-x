@@ -2,19 +2,6 @@
  * Copyright (C) 2020-2022, IrineSistiana
  *
  * This file is part of mosdns.
- *
- * mosdns is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * mosdns is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 package cache
@@ -83,6 +70,15 @@ type cachePlugin struct {
 	hitTotal     prometheus.Counter
 	lazyHitTotal prometheus.Counter
 	size         prometheus.GaugeFunc
+}
+
+type detachedContext struct {
+	context.Context
+	parentValues context.Context
+}
+
+func (d *detachedContext) Value(key interface{}) interface{} {
+	return d.parentValues.Value(key)
 }
 
 func Init(bp *coremain.BP, args interface{}) (p coremain.Plugin, err error) {
@@ -163,7 +159,7 @@ func (c *cachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, nex
 	if err != nil {
 		c.L().Error("get msg key", qCtx.InfoField(), zap.Error(err))
 	}
-	if len(msgKey) == 0 { // skip cache
+	if len(msgKey) == 0 {
 		return executable_seq.ExecChainNode(ctx, qCtx, next)
 	}
 
@@ -175,9 +171,9 @@ func (c *cachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, nex
 		c.lazyHitTotal.Inc()
 		c.doLazyUpdate(ctx, msgKey, qCtx, next)
 	}
-	if cachedResp != nil { // cache hit
+	if cachedResp != nil {
 		c.hitTotal.Inc()
-		cachedResp.Id = q.Id // change msg id
+		cachedResp.Id = q.Id
 		c.L().Debug("cache hit", qCtx.InfoField())
 		qCtx.SetResponse(cachedResp)
 		if c.whenHit != nil {
@@ -186,7 +182,6 @@ func (c *cachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, nex
 		return nil
 	}
 
-	// cache miss, run the entry and try to store its response.
 	c.L().Debug("cache miss", qCtx.InfoField())
 	err = executable_seq.ExecChainNode(ctx, qCtx, next)
 	r := qCtx.R()
@@ -198,8 +193,6 @@ func (c *cachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, nex
 	return err
 }
 
-// getMsgKey returns a string key for the query msg, or an empty
-// string if query should not be cached.
 func (c *cachePlugin) getMsgKey(q *dns.Msg) (string, error) {
 	isSimpleQuery := len(q.Question) == 1 && len(q.Answer) == 0 && len(q.Ns) == 0 && len(q.Extra) == 0
 	if isSimpleQuery || c.args.CacheEverything {
@@ -226,13 +219,9 @@ func (c *cachePlugin) getMsgKey(q *dns.Msg) (string, error) {
 	return "", nil
 }
 
-// lookupCache returns the cached response. The ttl of returned msg will be changed properly.
-// Remember, caller must change the msg id.
 func (c *cachePlugin) lookupCache(msgKey string) (r *dns.Msg, lazyHit bool, err error) {
-	// lookup in cache
 	v, storedTime, _ := c.backend.Get(msgKey)
 
-	// cache hit
 	if v != nil {
 		if c.args.CompressResp {
 			decodeLen, err := snappy.DecodedLen(v)
@@ -261,35 +250,35 @@ func (c *cachePlugin) lookupCache(msgKey string) (r *dns.Msg, lazyHit bool, err 
 			msgTTL = time.Duration(dnsutils.GetMinimalTTL(r)) * time.Second
 		}
 
-		// not expired
 		if storedTime.Add(msgTTL).After(time.Now()) {
 			dnsutils.SubtractTTL(r, uint32(time.Since(storedTime).Seconds()))
 			return r, false, nil
 		}
 
-		// expired but lazy update enabled
 		if c.args.LazyCacheTTL > 0 {
-			// set the default ttl
 			dnsutils.SetTTL(r, uint32(c.args.LazyCacheReplyTTL))
 			return r, true, nil
 		}
 	}
 
-	// cache miss
 	return nil, false, nil
 }
 
-// doLazyUpdate starts a new goroutine to execute next node and update the cache in the background.
-// It has an inner singleflight.Group to de-duplicate same msgKey.
 func (c *cachePlugin) doLazyUpdate(originalCtx context.Context, msgKey string, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) {
 	lazyQCtx := qCtx.Copy()
 	lazyUpdateFunc := func() (interface{}, error) {
 		c.L().Debug("start lazy cache update", lazyQCtx.InfoField())
 		defer c.lazyUpdateSF.Forget(msgKey)
-		baseCtx, cancel := context.WithTimeout(originalCtx, defaultLazyUpdateTimeout)
+
+		detached := &detachedContext{
+			Context:      context.Background(),
+			parentValues: originalCtx,
+		}
+
+		lazyCtx, cancel := context.WithTimeout(detached, defaultLazyUpdateTimeout)
 		defer cancel()
 
-		lazyCtx := context.WithValue(baseCtx, "mosdns_is_bg_update", true)
+		lazyCtx = context.WithValue(lazyCtx, "mosdns_is_bg_update", true)
 
 		err := executable_seq.ExecChainNode(lazyCtx, lazyQCtx, next)
 		if err != nil {
@@ -305,10 +294,9 @@ func (c *cachePlugin) doLazyUpdate(originalCtx context.Context, msgKey string, q
 		c.L().Debug("lazy cache updated", lazyQCtx.InfoField())
 		return nil, nil
 	}
-	c.lazyUpdateSF.DoChan(msgKey, lazyUpdateFunc) // DoChan won't block this goroutine
+	c.lazyUpdateSF.DoChan(msgKey, lazyUpdateFunc)
 }
 
-// tryStoreMsg tries to store r to cache. If r should be cached.
 func (c *cachePlugin) tryStoreMsg(key string, r *dns.Msg) error {
 	if r.Truncated {
 		return nil
@@ -335,8 +323,8 @@ func (c *cachePlugin) tryStoreMsg(key string, r *dns.Msg) error {
 	}
 	if c.args.CompressResp {
 		compressBuf := pool.GetBuf(snappy.MaxEncodedLen(len(v)))
-		v = snappy.Encode(compressBuf.Bytes(), v)
 		defer compressBuf.Release()
+		v = snappy.Encode(compressBuf.Bytes(), v)
 	}
 	c.backend.Store(key, v, now, expirationTime)
 	return nil
