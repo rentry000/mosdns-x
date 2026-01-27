@@ -85,7 +85,6 @@ type cachePlugin struct {
 	size         prometheus.GaugeFunc
 }
 
-// detachedContext preserves Values from parent but ignores parent's cancellation.
 type detachedContext struct {
 	context.Context
 	parentValues context.Context
@@ -294,8 +293,10 @@ func (c *cachePlugin) lookupCache(msgKey string) (r *dns.Msg, lazyHit bool, err 
 // It has an inner singleflight.Group to de-duplicate same msgKey.
 func (c *cachePlugin) doLazyUpdate(ctx context.Context, msgKey string, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) {
 	lazyQCtx := qCtx.Copy()
-	qCopy := qCtx.Q().Copy()
-	lazyQCtx.QCtx = qCopy 
+	q := lazyQCtx.Q()
+	if q != nil {
+		*q = *(qCtx.Q().Copy())
+	}
 
 	go func() {
 		_, _, _ = c.lazyUpdateSF.Do(msgKey, func() (interface{}, error) {
