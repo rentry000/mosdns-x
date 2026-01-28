@@ -16,7 +16,6 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
-
 package bundled_upstream
 
 import (
@@ -113,14 +112,11 @@ func ExchangeParallel(ctx context.Context, qCtx *query_context.Context, upstream
 
 	for res := range c {
 		if res.err != nil {
-			// Suppress logging for context cancellation as it is an expected behavior
-			if !errors.Is(res.err, context.Canceled) {
-				logger.Warn("upstream failed",
-					qCtx.InfoField(),
-					zap.String("addr", res.from.Address()),
-					zap.Error(res.err))
-				lastErr = res.err
-			}
+			logger.Warn("upstream failed detail",
+				qCtx.InfoField(),
+				zap.String("addr", res.from.Address()),
+				zap.Error(res.err))
+			lastErr = res.err
 			continue
 		}
 
@@ -146,7 +142,7 @@ func ExchangeParallel(ctx context.Context, qCtx *query_context.Context, upstream
 	}
 
 	// Return the last network error if no valid DNS responses were received
-	if lastErr != nil && !errors.Is(lastErr, context.Canceled) {
+	if lastErr != nil {
 		return nil, lastErr
 	}
 
