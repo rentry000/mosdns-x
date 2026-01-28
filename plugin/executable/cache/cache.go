@@ -1,6 +1,5 @@
 /*
  * Copyright (C) 2020-2022, IrineSistiana
- *
  * This file is part of mosdns.
  */
 
@@ -72,6 +71,7 @@ type cachePlugin struct {
 	size         prometheus.GaugeFunc
 }
 
+// detachedContext tách biệt tín hiệu Cancel của client nhưng giữ lại Values cho Upstream/Logging.
 type detachedContext struct {
 	context.Context
 	parentValues context.Context
@@ -159,7 +159,7 @@ func (c *cachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, nex
 	if err != nil {
 		c.L().Error("get msg key", qCtx.InfoField(), zap.Error(err))
 	}
-	if len(msgKey) == 0 { // skip cache
+	if len(msgKey) == 0 {
 		return executable_seq.ExecChainNode(ctx, qCtx, next)
 	}
 
@@ -167,13 +167,15 @@ func (c *cachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, nex
 	if err != nil {
 		c.L().Error("lookup cache", qCtx.InfoField(), zap.Error(err))
 	}
+
 	if lazyHit {
 		c.lazyHitTotal.Inc()
 		c.doLazyUpdate(ctx, msgKey, qCtx, next)
 	}
-	if cachedResp != nil { // cache hit
+
+	if cachedResp != nil {
 		c.hitTotal.Inc()
-		cachedResp.Id = q.Id // change msg id
+		cachedResp.Id = q.Id
 		c.L().Debug("cache hit", qCtx.InfoField())
 		qCtx.SetResponse(cachedResp)
 		if c.whenHit != nil {
@@ -182,7 +184,6 @@ func (c *cachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, nex
 		return nil
 	}
 
-	// cache miss, run the entry and try to store its response.
 	c.L().Debug("cache miss", qCtx.InfoField())
 	err = executable_seq.ExecChainNode(ctx, qCtx, next)
 	r := qCtx.R()
@@ -199,43 +200,25 @@ func (c *cachePlugin) getMsgKey(q *dns.Msg) (string, error) {
 	if isSimpleQuery || c.args.CacheEverything {
 		return dnsutils.GetMsgKey(q, 0)
 	}
-
-	if len(q.Question) == 1 {
-		simpleQ := *q
-		simpleQ.Answer = nil
-		simpleQ.Ns = nil
-		simpleQ.Extra = nil
-
-		return dnsutils.GetMsgKey(&simpleQ, 0)
-	}
-
 	return "", nil
 }
 
 func (c *cachePlugin) lookupCache(msgKey string) (r *dns.Msg, lazyHit bool, err error) {
 	v, storedTime, _ := c.backend.Get(msgKey)
-
 	if v != nil {
 		if c.args.CompressResp {
 			decodeLen, err := snappy.DecodedLen(v)
 			if err != nil {
 				return nil, false, fmt.Errorf("snappy decode err: %w", err)
 			}
-			if decodeLen > dns.MaxMsgSize {
-				return nil, false, fmt.Errorf("invalid snappy data, not a dns msg, data len: %d", decodeLen)
+			decompressBuf := pool.GetBuf(decodeLen)
+			decoded, err := snappy.Decode(decompressBuf.Bytes(), v)
+			if err != nil {
+				decompressBuf.Release()
+				return nil, false, fmt.Errorf("snappy decode err: %w", err)
 			}
-			
-			// Scope decompressBuf for manual release
-			{
-				decompressBuf := pool.GetBuf(decodeLen)
-				decoded, err := snappy.Decode(decompressBuf.Bytes(), v)
-				if err != nil {
-					decompressBuf.Release()
-					return nil, false, fmt.Errorf("snappy decode err: %w", err)
-				}
-				v = append([]byte(nil), decoded...)
-				decompressBuf.Release() // Release as soon as data is cloned
-			}
+			v = append([]byte(nil), decoded...)
+			decompressBuf.Release()
 		}
 		r = new(dns.Msg)
 		if err := r.Unpack(v); err != nil {
@@ -259,46 +242,39 @@ func (c *cachePlugin) lookupCache(msgKey string) (r *dns.Msg, lazyHit bool, err 
 			return r, true, nil
 		}
 	}
-
 	return nil, false, nil
 }
 
 func (c *cachePlugin) doLazyUpdate(ctx context.Context, msgKey string, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) {
 	lazyQCtx := qCtx.Copy()
+	
+	c.lazyUpdateSF.DoChan(msgKey, func() (interface{}, error) {
+		c.L().Debug("start lazy cache update", lazyQCtx.InfoField())
+		defer c.lazyUpdateSF.Forget(msgKey)
 
-	go func() {
-		_, _, _ = c.lazyUpdateSF.Do(msgKey, func() (interface{}, error) {
-			defer c.lazyUpdateSF.Forget(msgKey)
+		detached := &detachedContext{
+			Context:      context.Background(),
+			parentValues: ctx,
+		}
+		lazyCtx, cancel := context.WithTimeout(detached, defaultLazyUpdateTimeout)
+		defer cancel()
 
-			detached := &detachedContext{
-				Context:      context.Background(),
-				parentValues: ctx,
-			}
-			baseCtx, cancel := context.WithTimeout(detached, defaultLazyUpdateTimeout)
-			defer cancel()
+		err := executable_seq.ExecChainNode(lazyCtx, lazyQCtx, next)
+		if err != nil {
+			c.L().Warn("failed to update lazy cache", lazyQCtx.InfoField(), zap.Error(err))
+		}
 
-			err := executable_seq.ExecChainNode(baseCtx, lazyQCtx, next)
-
-			if err != nil {
-				c.L().Warn("LAZY UPDATE FAILED", lazyQCtx.InfoField(), zap.Error(err))
-			}
-
-			r := lazyQCtx.R()
-			if r != nil {
-				if err := c.tryStoreMsg(msgKey, r); err != nil {
-					c.L().Error("cache store", lazyQCtx.InfoField(), zap.Error(err))
-				}
-			}
-			return nil, nil
-		})
-	}()
+		r := lazyQCtx.R()
+		if r != nil {
+			_ = c.tryStoreMsg(msgKey, r)
+		}
+		c.L().Debug("lazy cache updated", lazyQCtx.InfoField())
+		return nil, nil
+	})
 }
 
 func (c *cachePlugin) tryStoreMsg(key string, r *dns.Msg) error {
-	if r.Truncated {
-		return nil
-	}
-	if r.Rcode != dns.RcodeSuccess && r.Rcode != dns.RcodeNameError {
+	if r.Truncated || (r.Rcode != dns.RcodeSuccess && r.Rcode != dns.RcodeNameError) {
 		return nil
 	}
 
@@ -320,13 +296,10 @@ func (c *cachePlugin) tryStoreMsg(key string, r *dns.Msg) error {
 	}
 
 	if c.args.CompressResp {
-		// Scope compressBuf for manual release
-		{
-			compressBuf := pool.GetBuf(snappy.MaxEncodedLen(len(v)))
-			encoded := snappy.Encode(compressBuf.Bytes(), v)
-			v = append([]byte(nil), encoded...)
-			compressBuf.Release() // Release before calling c.backend.Store
-		}
+		compressBuf := pool.GetBuf(snappy.MaxEncodedLen(len(v)))
+		compressed := snappy.Encode(compressBuf.Bytes(), v)
+		v = append([]byte(nil), compressed...)
+		compressBuf.Release()
 	}
 	c.backend.Store(key, v, now, expirationTime)
 	return nil
