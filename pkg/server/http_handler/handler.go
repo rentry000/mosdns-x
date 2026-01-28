@@ -7,14 +7,6 @@
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 3 of the License, or
  * (at your option) any later version.
- *
- * mosdns is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 package http_handler
@@ -44,28 +36,12 @@ import (
 var nopLogger = zap.NewNop()
 
 type HandlerOpts struct {
-	// DNSHandler is required.
-	DNSHandler dns_handler.Handler
-
-	// Path specifies the query endpoint. If it is empty, Handler
-	// will ignore the request path.
-	Path string
-
-	// SrcIPHeader specifies the header that contain client source address.
-	// "True-Client-IP" "X-Real-IP" "X-Forwarded-For" will parse automatically.
+	DNSHandler  dns_handler.Handler
+	Path        string
 	SrcIPHeader string
-
-	// HealthPath specifies the health check endpoint path.
-	// Default is "/health"
-	HealthPath string
-
-	// RedirectURL specifies the URL to redirect when accessing non-DNS paths.
-	// If empty, returns 404 for non-DNS paths.
+	HealthPath  string
 	RedirectURL string
-
-	// Logger specifies the logger which Handler writes its log to.
-	// Default is a nop logger.
-	Logger *zap.Logger
+	Logger      *zap.Logger
 }
 
 func (opts *HandlerOpts) Init() error {
@@ -126,7 +102,6 @@ type TlsInfo struct {
 }
 
 func (h *Handler) ServeHTTP(w ResponseWriter, req Request) {
-	// get remote addr from header and request
 	meta := new(C.RequestMeta)
 	if addr, err := getRemoteAddr(req, h.opts.SrcIPHeader); err == nil {
 		meta.SetClientAddr(addr)
@@ -146,25 +121,21 @@ func (h *Handler) ServeHTTP(w ResponseWriter, req Request) {
 		meta.SetProtocol(C.ProtocolHTTP)
 	}
 
-	// Handle health check endpoint
+	// 1. Health check - Always allow
 	if h.opts.HealthPath != "" && req.URL().Path == h.opts.HealthPath {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 		return
 	}
 
-	// Handle redirect for root or non-DNS paths
-	if h.opts.RedirectURL != "" && (req.URL().Path == "/" || (len(h.opts.Path) != 0 && req.URL().Path != h.opts.Path)) {
-		w.Header().Set("Location", h.opts.RedirectURL)
-		w.WriteHeader(http.StatusFound)
-		return
-	}
-
-	// check url path
-	if len(h.opts.Path) != 0 && req.URL().Path != h.opts.Path {
+	// 2. Path & Root validation - Redirect browsers/scanners early
+	if (len(h.opts.Path) != 0 && req.URL().Path != h.opts.Path) || req.URL().Path == "/" {
+		if h.opts.RedirectURL != "" {
+			w.Header().Set("Location", h.opts.RedirectURL)
+			w.WriteHeader(http.StatusFound)
+			return
+		}
 		w.WriteHeader(http.StatusNotFound)
-		w.Write([]byte("invalid request path"))
-		h.warnErr(req, fmt.Errorf("invalid request path %s", req.URL().Path))
 		return
 	}
 
@@ -173,13 +144,8 @@ func (h *Handler) ServeHTTP(w ResponseWriter, req Request) {
 
 	switch req.Method() {
 	case http.MethodGet:
+		// 3. GET validation - Silent redirect for non-DoH Accept headers
 		accept := req.Header().Get("Accept")
-		if accept == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte("missing Accept header"))
-			h.warnErr(req, fmt.Errorf("missing Accept header"))
-			return
-		}
 		var matched bool
 		for _, v := range strings.Split(accept, ",") {
 			mediatype := strings.TrimSpace(strings.SplitN(v, ";", 2)[0])
@@ -188,10 +154,14 @@ func (h *Handler) ServeHTTP(w ResponseWriter, req Request) {
 				break
 			}
 		}
+
 		if !matched {
+			if h.opts.RedirectURL != "" {
+				w.Header().Set("Location", h.opts.RedirectURL)
+				w.WriteHeader(http.StatusFound)
+				return
+			}
 			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte("invalid Accept header"))
-			h.warnErr(req, fmt.Errorf("invalid Accept header: %s", accept))
 			return
 		}
 
@@ -199,64 +169,53 @@ func (h *Handler) ServeHTTP(w ResponseWriter, req Request) {
 		if len(s) == 0 {
 			w.WriteHeader(http.StatusBadRequest)
 			w.Write([]byte("no dns param"))
-			h.warnErr(req, fmt.Errorf("no dns param"))
 			return
 		}
 
 		b, err = base64.RawURLEncoding.DecodeString(s)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte("invalid dns param"))
-			h.warnErr(req, fmt.Errorf("decode base64 query failed: %s", err))
+			h.warnErr(req, fmt.Errorf("decode base64 failed: %s", err))
 			return
 		}
+
 	case http.MethodPost:
+		// 4. POST validation - RFC 8484 strictly requires 4xx, no redirect
 		if contentType := req.Header().Get("Content-Type"); contentType != "application/dns-message" {
 			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte("invalid Content-Type header"))
-			h.warnErr(req, fmt.Errorf("invalid Content-Type header: %s", contentType))
+			w.Write([]byte("invalid Content-Type"))
 			return
 		}
 
 		b, err = io.ReadAll(req.Body())
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte("invalid request body"))
-			h.warnErr(req, fmt.Errorf("read request body failed: %s", err))
 			return
 		}
+
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
-		w.Write([]byte("invalid request method"))
-		h.warnErr(req, fmt.Errorf("invalid method: %s", req.Method()))
 		return
 	}
 
-	// read msg
+	// 5. DNS Unpack and Processing
 	m := new(dns.Msg)
 	if err := m.Unpack(b); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte("invalid request message"))
-		h.warnErr(req, fmt.Errorf("unpack request failed: %s", err))
+		h.warnErr(req, fmt.Errorf("unpack dns msg failed: %s", err))
 		return
-	}
-
-	if m.Id != 0 {
-		h.opts.Logger.Debug(fmt.Sprintf("irregular message id: %d", m.Id))
 	}
 
 	r, err := h.opts.DNSHandler.ServeDNS(req.Context(), m, meta)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("handle response failed"))
-		h.warnErr(req, fmt.Errorf("handle response failed: %s", err))
+		h.warnErr(req, fmt.Errorf("dns handler error: %s", err))
 		return
 	}
 
 	b, buf, err := pool.PackBuffer(r)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("pack response failed"))
 		h.warnErr(req, fmt.Errorf("pack response failed: %s", err))
 		return
 	}
@@ -265,10 +224,7 @@ func (h *Handler) ServeHTTP(w ResponseWriter, req Request) {
 	w.Header().Set("Content-Type", "application/dns-message")
 	w.Header().Set("Cache-Control", fmt.Sprintf("max-age=%d", dnsutils.GetMinimalTTL(r)))
 	w.WriteHeader(http.StatusOK)
-	if _, err := w.Write(b); err != nil {
-		h.warnErr(req, fmt.Errorf("write response failed: %s", err))
-		return
-	}
+	_, _ = w.Write(b)
 }
 
 func getRemoteAddr(req Request, customHeader string) (netip.Addr, error) {
