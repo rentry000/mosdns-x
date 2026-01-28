@@ -9,7 +9,6 @@ package dns_handler
 import (
 	"context"
 	"errors"
-	"fmt"
 	"testing"
 	"time"
 
@@ -53,7 +52,6 @@ type EntryHandler struct {
 	opts EntryHandlerOpts
 }
 
-// NewEntryHandler returns Handler interface directly (Option A - Standard)
 func NewEntryHandler(opts EntryHandlerOpts) (Handler, error) {
 	if err := opts.Init(); err != nil {
 		return nil, err
@@ -62,13 +60,13 @@ func NewEntryHandler(opts EntryHandlerOpts) (Handler, error) {
 }
 
 func (h *EntryHandler) ServeDNS(ctx context.Context, req *dns.Msg, meta *query_context.RequestMeta) (*dns.Msg, error) {
-	// 1. Setup Query-level isolation context
+	// 1. Independent per-query timeout context
 	qCtx, cancel := context.WithTimeout(ctx, h.opts.QueryTimeout)
 	defer cancel()
 
-	// 2. FormError checks
+	// 2. Format validation
 	if len(req.Question) == 0 {
-		h.opts.Logger.Debug("request has zero question", zap.Stringer("from", meta.ClientAddr()))
+		h.opts.Logger.Debug("request has zero question")
 		return h.responseFormErr(req), nil
 	}
 	for _, question := range req.Question {
@@ -81,12 +79,11 @@ func (h *EntryHandler) ServeDNS(ctx context.Context, req *dns.Msg, meta *query_c
 	origID := req.Id
 	queryCtx := query_context.NewContext(req, meta)
 
-	// 3. Execute Pipeline with isolated context
-	// Verified signature: Exec(ctx context.Context, qCtx *query_context.Context, next Executable) error
+	// 3. Execution
 	err := h.opts.Entry.Exec(qCtx, queryCtx, nil)
 	respMsg := queryCtx.R()
 
-	// 4. Smart Logging (Downgrade expected network/timeout errors)
+	// 4. Smart Logging (No spam for client cancellations/timeouts)
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			h.opts.Logger.Debug("query interrupted", queryCtx.InfoField(), zap.Error(err))
@@ -95,7 +92,7 @@ func (h *EntryHandler) ServeDNS(ctx context.Context, req *dns.Msg, meta *query_c
 		}
 	}
 
-	// 5. Fallback Response Logic
+	// 5. Response Finalization
 	if respMsg == nil {
 		if err == nil {
 			h.opts.Logger.Error("entry returned with nil response", queryCtx.InfoField())
@@ -105,19 +102,18 @@ func (h *EntryHandler) ServeDNS(ctx context.Context, req *dns.Msg, meta *query_c
 		respMsg.SetReply(req)
 		
 		if err != nil {
-			respMsg.Rcode = dns.RcodeServerFailure // SERVFAIL for upstream/timeout issues
+			respMsg.Rcode = dns.RcodeServerFailure
 		} else {
-			respMsg.Rcode = dns.RcodeRefused       // REFUSED for plugin logic gaps
+			respMsg.Rcode = dns.RcodeRefused
 		}
 	}
 
-	// 6. Final headers
 	if h.opts.RecursionAvailable {
 		respMsg.RecursionAvailable = true
 	}
 	respMsg.Id = origID
 
-	// Always return nil error to keep the connection alive (Sequential/DoH/DoQ friendly)
+	// Always return nil error to prevent server from killing TCP/DoT connections
 	return respMsg, nil
 }
 
@@ -131,7 +127,6 @@ func (h *EntryHandler) responseFormErr(req *dns.Msg) *dns.Msg {
 	return res
 }
 
-// DummyServerHandler for testing
 type DummyServerHandler struct {
 	T       *testing.T
 	WantMsg *dns.Msg
