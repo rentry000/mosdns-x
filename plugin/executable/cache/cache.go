@@ -71,7 +71,6 @@ type cachePlugin struct {
 	size         prometheus.GaugeFunc
 }
 
-// detachedContext tách biệt tín hiệu Cancel của client nhưng giữ lại Values cho Upstream/Logging.
 type detachedContext struct {
 	context.Context
 	parentValues context.Context
@@ -248,29 +247,33 @@ func (c *cachePlugin) lookupCache(msgKey string) (r *dns.Msg, lazyHit bool, err 
 func (c *cachePlugin) doLazyUpdate(ctx context.Context, msgKey string, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) {
 	lazyQCtx := qCtx.Copy()
 	
-	c.lazyUpdateSF.DoChan(msgKey, func() (interface{}, error) {
-		c.L().Debug("start lazy cache update", lazyQCtx.InfoField())
-		defer c.lazyUpdateSF.Forget(msgKey)
+	// Wrap singleflight.Do in a goroutine to handle background execution
+	// and avoid blocking the main execution thread.
+	go func() {
+		_, _, _ = c.lazyUpdateSF.Do(msgKey, func() (interface{}, error) {
+			c.L().Debug("start lazy cache update", lazyQCtx.InfoField())
+			defer c.lazyUpdateSF.Forget(msgKey)
 
-		detached := &detachedContext{
-			Context:      context.Background(),
-			parentValues: ctx,
-		}
-		lazyCtx, cancel := context.WithTimeout(detached, defaultLazyUpdateTimeout)
-		defer cancel()
+			detached := &detachedContext{
+				Context:      context.Background(),
+				parentValues: ctx,
+			}
+			lazyCtx, cancel := context.WithTimeout(detached, defaultLazyUpdateTimeout)
+			defer cancel()
 
-		err := executable_seq.ExecChainNode(lazyCtx, lazyQCtx, next)
-		if err != nil {
-			c.L().Warn("failed to update lazy cache", lazyQCtx.InfoField(), zap.Error(err))
-		}
+			err := executable_seq.ExecChainNode(lazyCtx, lazyQCtx, next)
+			if err != nil {
+				c.L().Warn("failed to update lazy cache", lazyQCtx.InfoField(), zap.Error(err))
+			}
 
-		r := lazyQCtx.R()
-		if r != nil {
-			_ = c.tryStoreMsg(msgKey, r)
-		}
-		c.L().Debug("lazy cache updated", lazyQCtx.InfoField())
-		return nil, nil
-	})
+			r := lazyQCtx.R()
+			if r != nil {
+				_ = c.tryStoreMsg(msgKey, r)
+			}
+			c.L().Debug("lazy cache updated", lazyQCtx.InfoField())
+			return nil, nil
+		})
+	}()
 }
 
 func (c *cachePlugin) tryStoreMsg(key string, r *dns.Msg) error {
