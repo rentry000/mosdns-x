@@ -9,6 +9,8 @@ package bundled_upstream
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/miekg/dns"
@@ -43,7 +45,6 @@ func ExchangeParallel(ctx context.Context, qCtx *query_context.Context, upstream
 	}
 
 	q := qCtx.Q()
-
 	if t == 1 {
 		return upstreams[0].Exchange(ctx, q)
 	}
@@ -74,33 +75,49 @@ func ExchangeParallel(ctx context.Context, qCtx *query_context.Context, upstream
 		close(c)
 	}()
 
+	var errMsgs []string
+
 	for res := range c {
 		if res.err != nil {
 			logger.Debug("upstream exchange failed",
 				qCtx.InfoField(),
 				zap.String("addr", res.from.Address()),
 				zap.Error(res.err))
+
+			if !errors.Is(res.err, context.Canceled) && !errors.Is(res.err, context.DeadlineExceeded) {
+				errMsgs = append(errMsgs, fmt.Sprintf("[%s: %v]", res.from.Address(), res.err))
+			}
 			continue
 		}
 
-		if res.r == nil {
-			continue
-		}
-
-		if res.from.Trusted() || res.r.Rcode == dns.RcodeSuccess {
+		if res.r != nil && (res.from.Trusted() || res.r.Rcode == dns.RcodeSuccess) {
 			cancel()
 			return res.r, nil
 		}
 
-		logger.Debug("discarded untrusted error response",
-			qCtx.InfoField(),
-			zap.String("addr", res.from.Address()),
-			zap.String("rcode", dns.RcodeToString[res.r.Rcode]))
+		if res.r != nil {
+			logger.Debug("discarded untrusted error response",
+				qCtx.InfoField(),
+				zap.String("addr", res.from.Address()),
+				zap.String("rcode", dns.RcodeToString[res.r.Rcode]))
+			errMsgs = append(errMsgs, fmt.Sprintf("[%s: rcode %s]", res.from.Address(), dns.RcodeToString[res.r.Rcode]))
+		}
 	}
 
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	return nil, ErrAllFailed
+	var detailedErr error
+	if len(errMsgs) > 0 {
+		detailedErr = errors.New("all upstreams failed: " + strings.Join(errMsgs, ", "))
+	} else {
+		detailedErr = ErrAllFailed
+	}
+
+	logger.Warn("parallel exchange failed",
+		qCtx.InfoField(),
+		zap.Error(detailedErr))
+
+	return nil, detailedErr
 }
