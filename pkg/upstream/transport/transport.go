@@ -45,10 +45,11 @@ const (
 	defaultDialTimeout             = time.Second * 5
 	defaultNoConnReuseQueryTimeout = time.Second * 5
 	defaultMaxConns                = 2
-	defaultMaxQueryPerConn         = 65535
+	defaultMaxQueryPerConn          = 65535
 
 	writeTimeout        = time.Second
-	connTooOldThreshold = time.Millisecond * 500
+	// Tối ưu: Nâng lên 1500ms để MosDNS chủ động đóng kết nối cũ sớm, né RST từ Cloudflare
+	connTooOldThreshold = time.Millisecond * 1500
 )
 
 // Opts for Transport,
@@ -202,7 +203,8 @@ func (t *Transport) exchangeWithPipelineConn(ctx context.Context, m *dns.Msg) (*
 		wg.Done()
 
 		if err != nil {
-			if !isNewConn && attempt <= maxRetry {
+			// Tối ưu: Chặn đứng Retry nếu lỗi là context.Canceled (client đã ngắt kết nối)
+			if !isNewConn && attempt <= maxRetry && !errors.Is(err, context.Canceled) {
 				continue
 			}
 			return nil, err
@@ -267,7 +269,8 @@ func (t *Transport) exchangeWithReusableConn(ctx context.Context, m *dns.Msg) (*
 		r, err := conn.exchangeConnReuse(ctx, m)
 		t.releaseReusableConn(conn, err)
 		if err != nil {
-			if !isNewConn && attempt <= maxRetry {
+			// Tối ưu: Chặn đứng Retry nếu lỗi là context.Canceled (client đã ngắt kết nối)
+			if !isNewConn && attempt <= maxRetry && !errors.Is(err, context.Canceled) {
 				continue
 			}
 			return nil, err
