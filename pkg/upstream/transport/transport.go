@@ -42,13 +42,12 @@ var (
 
 const (
 	defaultIdleTimeout             = time.Second * 10
-	defaultDialTimeout             = time.Second * 5
-	defaultNoConnReuseQueryTimeout = time.Second * 5
+	defaultDialTimeout             = time.Second * 7
+	defaultNoConnReuseQueryTimeout = time.Second * 7
 	defaultMaxConns                = 2
 	defaultMaxQueryPerConn          = 65535
 
 	writeTimeout        = time.Second
-	// Tối ưu: Nâng lên 1500ms để MosDNS chủ động đóng kết nối cũ sớm, né RST từ Cloudflare
 	connTooOldThreshold = time.Millisecond * 1500
 )
 
