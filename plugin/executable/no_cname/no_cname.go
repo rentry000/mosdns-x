@@ -16,6 +16,7 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+
 package no_cname
 
 import (
@@ -41,12 +42,21 @@ type noCNAME struct {
 }
 
 func (t *noCNAME) Exec(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
+	// Execute the rest of the chain first to get the response
 	if err := executable_seq.ExecChainNode(ctx, qCtx, next); err != nil {
 		return err
 	}
 	
 	r := qCtx.R()
+	// Skip if response is nil or has no questions
 	if r == nil || len(r.Question) == 0 {
+		return nil
+	}
+
+	// Only process CNAME flattening for A (IPv4) or AAAA (IPv6) records.
+	// Processing SRV, MX, or other types will cause malformed responses (SERVFAIL).
+	qType := r.Question[0].Qtype
+	if qType != dns.TypeA && qType != dns.TypeAAAA {
 		return nil
 	}
 	
@@ -54,9 +64,11 @@ func (t *noCNAME) Exec(ctx context.Context, qCtx *query_context.Context, next ex
 	filtered := r.Answer[:0]
 	
 	for _, rr := range r.Answer {
+		// Remove CNAME records from the answer section
 		if rr.Header().Rrtype == dns.TypeCNAME {
 			continue
 		}
+		// Rewrite the record header name to match the original question name
 		rr.Header().Name = qName
 		filtered = append(filtered, rr)
 	}
