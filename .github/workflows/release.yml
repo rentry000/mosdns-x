@@ -35,7 +35,7 @@ jobs:
         env:
           CGO_ENABLED: '0'
           GOEXPERIMENT: greenteagc
-          TZ: Asia/Hong_Kong
+          TZ: Asia/Ho_Chi_Minh
 
       - name: Publish
         uses: softprops/action-gh-release@v1
