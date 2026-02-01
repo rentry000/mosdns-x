@@ -35,7 +35,8 @@ func init() {
 }
 
 const (
-	defaultLazyUpdateTimeout = time.Second * 5
+	// Increased timeout to accommodate complex pipelines with retries or high latency upstreams
+	defaultLazyUpdateTimeout = time.Second * 10
 	defaultEmptyAnswerTTL    = time.Second * 300
 )
 
@@ -112,7 +113,7 @@ func newCachePlugin(bp *coremain.BP, args *Args) (*cachePlugin, error) {
 		m := bp.M().GetExecutables()
 		whenHit = m[tag]
 		if whenHit == nil {
-			return nil, fmt.Errorf("cannot find exectable %s", tag)
+			return nil, fmt.Errorf("cannot find executable %s", tag)
 		}
 	}
 
@@ -181,7 +182,10 @@ func (c *cachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, nex
 	c.L().Debug("cache miss", qCtx.InfoField())
 	err = executable_seq.ExecChainNode(ctx, qCtx, next)
 	r := qCtx.R()
-	if r != nil && err == nil {
+
+	// Pragmatic approach: Store response if it exists, even if execution returned an error (e.g., timeout).
+	// This ensures cache is populated as long as a valid response was eventually received.
+	if r != nil {
 		if err := c.tryStoreMsg(msgKey, r); err != nil {
 			c.L().Debug("cache store failed", qCtx.InfoField(), zap.Error(err))
 		}
@@ -212,6 +216,7 @@ func (c *cachePlugin) lookupCache(msgKey string) (r *dns.Msg, lazyHit bool, err 
 			if err != nil {
 				return nil, false, fmt.Errorf("snappy decode err: %w", err)
 			}
+			// Copy data to an independent slice before buffer is released back to pool
 			v = append([]byte(nil), decoded...)
 		}
 		r = new(dns.Msg)
@@ -257,9 +262,10 @@ func (c *cachePlugin) doLazyUpdate(ctx context.Context, msgKey string, qCtx *que
 			err := executable_seq.ExecChainNode(lazyCtx, lazyQCtx, next)
 			if err != nil {
 				c.L().Warn("failed to update lazy cache", lazyQCtx.InfoField(), zap.Error(err))
-				return nil, nil
 			}
 
+			// Try storing response even if execution failed (e.g., deadline exceeded),
+			// provided a response object was populated in qCtx.
 			r := lazyQCtx.R()
 			if r != nil {
 				_ = c.tryStoreMsg(msgKey, r)
@@ -297,6 +303,7 @@ func (c *cachePlugin) tryStoreMsg(key string, r *dns.Msg) error {
 		defer compressBuf.Release()
 
 		compressed := snappy.Encode(compressBuf.Bytes(), v)
+		// Deep copy to ensure data stability after buffer release
 		v = append([]byte(nil), compressed...)
 	}
 
