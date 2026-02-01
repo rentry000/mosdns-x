@@ -1,17 +1,18 @@
+/*
+ * Copyright (C) 2020-2026, IrineSistiana
+ * Updated: Transport-centric Retry Logic (Fixed Error Propagation & Type Name)
+ */
+
 package retry_servfail
 
 import (
 	"context"
-
-	"github.com/miekg/dns"
 	"github.com/pmkol/mosdns-x/coremain"
 	"github.com/pmkol/mosdns-x/pkg/executable_seq"
 	"github.com/pmkol/mosdns-x/pkg/query_context"
 )
 
-const (
-	PluginType = "retry_servfail"
-)
+const PluginType = "retry_servfail"
 
 func init() {
 	coremain.RegNewPersetPluginFunc("_retry_servfail", func(bp *coremain.BP) (coremain.Plugin, error) {
@@ -25,69 +26,37 @@ type retryServfail struct {
 	*coremain.BP
 }
 
-// isPermanentEDE returns true if the EDE code indicates a permanent failure
-// where retrying would be useless.
-func isPermanentEDE(code uint16) bool {
-	switch code {
-	case
-		9,  // DNSSEC Bogus
-		15, // Blocked
-		16, // Censored
-		17, // Filtered
-		22, // No Reachable Authoritative (Lame delegation)
-		23: // Network Error (Authoritative server unresponsive)
-		return true
-	default:
-		return false
-	}
-}
-
 func (t *retryServfail) Exec(
 	ctx context.Context,
 	qCtx *query_context.Context,
 	next executable_seq.ExecutableChainNode,
 ) error {
-	// 1st attempt: Execute the remaining chain (typically upstream)
-	if err := executable_seq.ExecChainNode(ctx, qCtx, next); err != nil {
-		return err
-	}
+	// === Phase 1: First Attempt ===
+	err := executable_seq.ExecChainNode(ctx, qCtx, next)
 
-	r := qCtx.R()
-	shouldRetry := false
+	// Decision Matrix:
+	// - err != nil: Network timeout, connection reset, handshake failed, etc.
+	// - qCtx.R() == nil: No response received despite no transport error.
+	// - If qCtx.R() is present: Transport succeeded (even if Rcode is SERVFAIL).
+	shouldRetry := err != nil || qCtx.R() == nil
 
-	if r == nil {
-		// Transport error or nil response
-		shouldRetry = true
-	} else if r.Rcode == dns.RcodeServerFailure && len(r.Ns) == 0 {
-		// Default to retry for empty SERVFAIL
-		shouldRetry = true
-
-		// Check for Extended DNS Errors (EDE) in Extra records
-		for _, extra := range r.Extra {
-			if opt, ok := extra.(*dns.OPT); ok {
-				for _, option := range opt.Option {
-					if ede, ok := option.(*dns.EDNS0_EDE); ok {
-						if isPermanentEDE(ede.InfoCode) {
-							// Domain is confirmed dead or blocked, do not retry
-							shouldRetry = false
-							break
-						}
-					}
-				}
-			}
-			if !shouldRetry {
-				break
-			}
-		}
-	}
-
+	// === Phase 2: Conditional Retry ===
 	if shouldRetry {
-		t.L().Debug("transient failure detected, retrying upstream", qCtx.InfoField())
-		// Clear failed response state from context before retry
+		// Verify if the client is still waiting (prevent ghost retries)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		t.L().Debug("network transport failure detected, retrying upstream", qCtx.InfoField())
+
+		// Reset failed state before re-execution
 		qCtx.SetResponse(nil)
-		// 2nd attempt: Re-execute the remaining chain
-		return executable_seq.ExecChainNode(ctx, qCtx, next)
+
+		// === Phase 3: Second Attempt ===
+		// Overwrite 'err' with the result of the second attempt.
+		err = executable_seq.ExecChainNode(ctx, qCtx, next)
 	}
 
-	return nil
+	// === Phase 4: Final Error Return ===
+	return err
 }
