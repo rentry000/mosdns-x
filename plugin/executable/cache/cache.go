@@ -134,13 +134,13 @@ func (c *cachePlugin) Exec(
 	qCtx *query_context.Context,
 	next executable_seq.ExecutableChainNode,
 ) error {
-	c.queryTotal.Inc()
-
 	q := qCtx.Q()
 	key, err := c.buildKey(q)
 	if err != nil || key == "" {
 		return executable_seq.ExecChainNode(ctx, qCtx, next)
 	}
+
+	c.queryTotal.Inc()
 
 	// 1. LOOKUP
 	msg, lazy, err := c.lookup(key)
@@ -200,6 +200,7 @@ func (c *cachePlugin) buildKey(q *dns.Msg) (string, error) {
 }
 
 func (c *cachePlugin) lookup(key string) (msg *dns.Msg, lazy bool, err error) {
+	// backend.Get returns ([]byte, storedTime, expirationTime)
 	v, stored, _ := c.backend.Get(key)
 	if v == nil || len(v) < 4 {
 		return nil, false, nil
@@ -216,7 +217,7 @@ func (c *cachePlugin) lookup(key string) (msg *dns.Msg, lazy bool, err error) {
 		decBuf := pool.GetBuf(decLen)
 		defer decBuf.Release()
 
-		payload, err = snappy.Decode(decBuf.Bytes(), payload)
+		payload, err = snappy.Decode(decBuf.Bytes()[:0], payload)
 		if err != nil {
 			return nil, false, err
 		}
@@ -243,9 +244,14 @@ func (c *cachePlugin) lookup(key string) (msg *dns.Msg, lazy bool, err error) {
 	return nil, false, nil
 }
 
-func (c *cachePlugin) triggerLazyUpdate(key string, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) {
+func (c *cachePlugin) triggerLazyUpdate(
+	key string,
+	qCtx *query_context.Context,
+	next executable_seq.ExecutableChainNode,
+) {
 	go func() {
-		_, _, _ = c.sf.Do(key, func() (any, error) {
+		// singleflight.Do returns (any, error) in mosdns-x
+		_, _ = c.sf.Do(key, func() (any, error) {
 			c.L().Debug("lazy update start", zap.String("key", key))
 
 			lazyQCtx := qCtx.Copy()
@@ -290,16 +296,20 @@ func (c *cachePlugin) store(key string, r *dns.Msg) error {
 	}
 
 	var finalPayload []byte
+	var compBuf *pool.Buffer
+
 	if c.args.CompressResp {
-		compBuf := pool.GetBuf(snappy.MaxEncodedLen(len(raw)))
-		defer compBuf.Release()
-		finalPayload = snappy.Encode(compBuf.Bytes(), raw)
+		compBuf = pool.GetBuf(snappy.MaxEncodedLen(len(raw)))
+		finalPayload = snappy.Encode(compBuf.Bytes()[:0], raw)
 	} else {
 		finalPayload = raw
 	}
 
 	bufWrapper := pool.GetBuf(4 + len(finalPayload))
 	defer bufWrapper.Release()
+	if compBuf != nil {
+		defer compBuf.Release()
+	}
 
 	buf := bufWrapper.Bytes()
 	binary.BigEndian.PutUint32(buf[:4], ttl)
