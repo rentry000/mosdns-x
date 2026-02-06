@@ -155,11 +155,9 @@ func (c *cachePlugin) Exec(
 
 		if lazy {
 			c.lazyHitTotal.Inc()
-			// LOG: lazy hit
 			c.L().Debug("lazy hit", qCtx.InfoField(), zap.String("key", key))
 			c.triggerLazyUpdate(key, qCtx, next)
 		} else {
-			// LOG: hit
 			c.L().Debug("hit", qCtx.InfoField())
 		}
 
@@ -170,7 +168,6 @@ func (c *cachePlugin) Exec(
 	}
 
 	// 2. MISS
-	// LOG: miss
 	c.L().Debug("miss", qCtx.InfoField())
 	if err := executable_seq.ExecChainNode(ctx, qCtx, next); err != nil {
 		return err
@@ -203,15 +200,14 @@ func (c *cachePlugin) buildKey(q *dns.Msg) (string, error) {
 }
 
 func (c *cachePlugin) lookup(key string) (msg *dns.Msg, lazy bool, err error) {
-	v, stored, ok := c.backend.Get(key)
-	if !ok || len(v) < 4 {
+	v, stored, _ := c.backend.Get(key)
+	if v == nil || len(v) < 4 {
 		return nil, false, nil
 	}
 
 	ttl := binary.BigEndian.Uint32(v[:4])
 	payload := v[4:]
 
-	// Use buffer pooling for decompression to reduce GC pressure on "hit" path
 	if c.args.CompressResp {
 		decLen, err := snappy.DecodedLen(payload)
 		if err != nil {
@@ -249,7 +245,7 @@ func (c *cachePlugin) lookup(key string) (msg *dns.Msg, lazy bool, err error) {
 
 func (c *cachePlugin) triggerLazyUpdate(key string, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) {
 	go func() {
-		_, _ = c.sf.Do(key, func() (any, error) {
+		_, _, _ = c.sf.Do(key, func() (any, error) {
 			c.L().Debug("lazy update start", zap.String("key", key))
 
 			lazyQCtx := qCtx.Copy()
@@ -293,7 +289,6 @@ func (c *cachePlugin) store(key string, r *dns.Msg) error {
 		return err
 	}
 
-	// Use buffer pooling for compression to reduce GC pressure on "miss/store" path
 	var finalPayload []byte
 	if c.args.CompressResp {
 		compBuf := pool.GetBuf(snappy.MaxEncodedLen(len(raw)))
@@ -303,7 +298,6 @@ func (c *cachePlugin) store(key string, r *dns.Msg) error {
 		finalPayload = raw
 	}
 
-	// Wrap in a lean 4-byte header buffer from pool
 	bufWrapper := pool.GetBuf(4 + len(finalPayload))
 	defer bufWrapper.Release()
 
@@ -316,7 +310,6 @@ func (c *cachePlugin) store(key string, r *dns.Msg) error {
 		storageTTL += time.Duration(c.args.LazyCacheTTL) * time.Second
 	}
 
-	// Backend.Store makes its own copy if necessary
 	c.backend.Store(key, buf, time.Now(), time.Now().Add(storageTTL))
 	return nil
 }
