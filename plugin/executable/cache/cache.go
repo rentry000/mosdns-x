@@ -200,7 +200,6 @@ func (c *cachePlugin) buildKey(q *dns.Msg) (string, error) {
 }
 
 func (c *cachePlugin) lookup(key string) (msg *dns.Msg, lazy bool, err error) {
-	// API Match: Get(key) (v []byte, storedTime, expirationTime time.Time)
 	v, stored, _ := c.backend.Get(key)
 	if v == nil || len(v) < 4 {
 		return nil, false, nil
@@ -250,8 +249,8 @@ func (c *cachePlugin) triggerLazyUpdate(
 	next executable_seq.ExecutableChainNode,
 ) {
 	go func() {
-		// singleflight.Do returns (any, error) in mosdns-x
-		_, _ = c.sf.Do(key, func() (any, error) {
+		// FIX: Use 3 return values to match latest singleflight.Do signature
+		_, _, _ = c.sf.Do(key, func() (any, error) {
 			c.L().Debug("lazy update start", zap.String("key", key))
 
 			lazyQCtx := qCtx.Copy()
@@ -316,13 +315,12 @@ func (c *cachePlugin) store(key string, r *dns.Msg) error {
 	copy(buf[4:], finalPayload)
 
 	now := time.Now()
-	storageDuration := time.Duration(ttl) * time.Second
+	storageTTL := time.Duration(ttl) * time.Second
 	if c.args.LazyCacheTTL > 0 {
-		storageDuration += time.Duration(c.args.LazyCacheTTL) * time.Second
+		storageTTL += time.Duration(c.args.LazyCacheTTL) * time.Second
 	}
 
-	// API Match: Store(key, v, storedTime, expirationTime)
-	c.backend.Store(key, buf, now, now.Add(storageDuration))
+	c.backend.Store(key, buf, now, now.Add(storageTTL))
 	return nil
 }
 
