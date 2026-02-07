@@ -26,6 +26,8 @@ import (
 const PluginType = "cache"
 
 const (
+	cacheMagic               = 0x4D43 // "MC"
+	cacheVersion             = 0x01
 	defaultLazyUpdateTimeout = 10 * time.Second
 	defaultEmptyAnswerTTL    = 300 * time.Second
 )
@@ -110,30 +112,30 @@ func newCachePlugin(bp *coremain.BP, args *Args) (*cachePlugin, error) {
 		whenHit: whenHit,
 		backend: backend,
 
-		queryTotal:   prometheus.NewCounter(prometheus.CounterOpts{Name: "query_total"}),
-		hitTotal:     prometheus.NewCounter(prometheus.CounterOpts{Name: "hit_total"}),
-		lazyHitTotal: prometheus.NewCounter(prometheus.CounterOpts{Name: "lazy_hit_total"}),
+		queryTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "query_total",
+			Help: "Total queries eligible for caching",
+		}),
+		hitTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "hit_total",
+			Help: "Total fresh hits",
+		}),
+		lazyHitTotal: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "lazy_hit_total",
+			Help: "Total stale hits (lazy)",
+		}),
 		size: prometheus.NewGaugeFunc(
 			prometheus.GaugeOpts{Name: "cache_size"},
 			func() float64 { return float64(backend.Len()) },
 		),
 	}
 
-	bp.GetMetricsReg().MustRegister(
-		p.queryTotal,
-		p.hitTotal,
-		p.lazyHitTotal,
-		p.size,
-	)
+	bp.GetMetricsReg().MustRegister(p.queryTotal, p.hitTotal, p.lazyHitTotal, p.size)
 
 	return p, nil
 }
 
-func (c *cachePlugin) Exec(
-	ctx context.Context,
-	qCtx *query_context.Context,
-	next executable_seq.ExecutableChainNode,
-) error {
+func (c *cachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) error {
 	q := qCtx.Q()
 	key, err := c.buildKey(q)
 	if err != nil || key == "" {
@@ -142,10 +144,9 @@ func (c *cachePlugin) Exec(
 
 	c.queryTotal.Inc()
 
-	// 1. LOOKUP
 	msg, lazy, err := c.lookup(key)
 	if err != nil {
-		c.L().Error("lookup cache", zap.Error(err))
+		c.L().Debug("lookup cache internal error", zap.Error(err))
 	}
 
 	if msg != nil {
@@ -167,7 +168,6 @@ func (c *cachePlugin) Exec(
 		return nil
 	}
 
-	// 2. MISS
 	c.L().Debug("miss", qCtx.InfoField())
 	if err := executable_seq.ExecChainNode(ctx, qCtx, next); err != nil {
 		return err
@@ -185,58 +185,96 @@ func (c *cachePlugin) buildKey(q *dns.Msg) (string, error) {
 		return dnsutils.GetMsgKey(q, 0)
 	}
 
-	isSimpleQuery := len(q.Question) == 1 && len(q.Answer) == 0 && len(q.Ns) == 0 && len(q.Extra) == 0
-	if isSimpleQuery {
+	if len(q.Question) != 1 {
+		return "", nil
+	}
+
+	// Hot-path: Direct key for simple queries (No struct copy)
+	if len(q.Answer) == 0 && len(q.Ns) == 0 && len(q.Extra) == 0 {
 		return dnsutils.GetMsgKey(q, 0)
 	}
 
-	if len(q.Question) == 1 {
-		simpleQ := *q
-		simpleQ.Answer, simpleQ.Ns, simpleQ.Extra = nil, nil, nil
-		return dnsutils.GetMsgKey(&simpleQ, 0)
-	}
-
-	return "", nil
+	// Normalize key for domain + type only if metadata exists (Copy only when needed)
+	simpleQ := *q
+	simpleQ.Answer, simpleQ.Ns, simpleQ.Extra = nil, nil, nil
+	return dnsutils.GetMsgKey(&simpleQ, 0)
 }
 
 func (c *cachePlugin) lookup(key string) (msg *dns.Msg, lazy bool, err error) {
-	// Match backend API: Get(key) (value, storedAt, expirationTime)
 	v, stored, _ := c.backend.Get(key)
-	if v == nil || len(v) < 4 {
+	if v == nil {
 		return nil, false, nil
 	}
 
-	ttl := binary.BigEndian.Uint32(v[:4])
-	payload := v[4:]
+	var ttl uint32
+	var payload []byte
+	isNewFormat := false
 
-	if c.args.CompressResp {
-		decLen, err := snappy.DecodedLen(payload)
-		if err != nil {
-			return nil, false, err
-		}
-		decBuf := pool.GetBuf(decLen)
-		defer decBuf.Release()
-
-		payload, err = snappy.Decode(decBuf.Bytes()[:0], payload)
-		if err != nil {
-			return nil, false, err
+	// Format Detection [Magic: 2B][Version: 1B]
+	if len(v) >= 7 && binary.BigEndian.Uint16(v[0:2]) == cacheMagic {
+		if v[2] == cacheVersion {
+			ttl = binary.BigEndian.Uint32(v[3:7])
+			payload = v[7:]
+			isNewFormat = true
 		}
 	}
 
-	msg = new(dns.Msg)
-	if err := msg.Unpack(payload); err != nil {
-		return nil, false, err
+	if isNewFormat {
+		if len(payload) == 0 {
+			return nil, false, nil
+		}
+		if c.args.CompressResp {
+			decLen, err := snappy.DecodedLen(payload)
+			if err != nil || decLen <= 0 || decLen > dns.MaxMsgSize {
+				return nil, false, nil // Silent drop/Miss
+			}
+			decBuf := pool.GetBuf(decLen)
+			defer decBuf.Release()
+			payload, err = snappy.Decode(decBuf.Bytes()[:0], payload)
+			if err != nil {
+				return nil, false, nil
+			}
+		}
+		msg = new(dns.Msg)
+		if err := msg.Unpack(payload); err != nil {
+			return nil, false, nil
+		}
+	} else {
+		// Legacy Fallback with Decompression support
+		payload = v
+		if c.args.CompressResp {
+			decLen, err := snappy.DecodedLen(payload)
+			if err != nil || decLen <= 0 || decLen > dns.MaxMsgSize {
+				return nil, false, nil
+			}
+			decBuf := pool.GetBuf(decLen)
+			defer decBuf.Release()
+			payload, err = snappy.Decode(decBuf.Bytes()[:0], payload)
+			if err != nil {
+				return nil, false, nil
+			}
+		}
+		msg = new(dns.Msg)
+		if err := msg.Unpack(payload); err != nil {
+			return nil, false, nil
+		}
+		if len(msg.Answer) == 0 {
+			ttl = uint32(defaultEmptyAnswerTTL / time.Second)
+		} else {
+			ttl = dnsutils.GetMinimalTTL(msg)
+		}
 	}
 
+	// Unified TTL check (Fresh vs Stale)
 	now := time.Now()
-	expiration := stored.Add(time.Duration(ttl) * time.Second)
+	elapsed := uint32(now.Sub(stored).Seconds())
 
-	if now.Before(expiration) {
-		dnsutils.SubtractTTL(msg, uint32(now.Sub(stored).Seconds()))
+	if elapsed < ttl {
+		dnsutils.SubtractTTL(msg, elapsed)
 		return msg, false, nil
 	}
 
-	if c.args.LazyCacheTTL > 0 && now.Before(expiration.Add(time.Duration(c.args.LazyCacheTTL)*time.Second)) {
+	if c.args.LazyCacheTTL > 0 && elapsed < (ttl+uint32(c.args.LazyCacheTTL)) {
 		dnsutils.SetTTL(msg, uint32(c.args.LazyCacheReplyTTL))
 		return msg, true, nil
 	}
@@ -244,27 +282,18 @@ func (c *cachePlugin) lookup(key string) (msg *dns.Msg, lazy bool, err error) {
 	return nil, false, nil
 }
 
-func (c *cachePlugin) triggerLazyUpdate(
-	key string,
-	qCtx *query_context.Context,
-	next executable_seq.ExecutableChainNode,
-) {
+func (c *cachePlugin) triggerLazyUpdate(key string, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) {
 	go func() {
-		// FIXED: singleflight.Do returns 3 values (v, err, shared) as per documentation
 		_, _, _ = c.sf.Do(key, func() (any, error) {
 			c.L().Debug("lazy update start", zap.String("key", key))
-
 			lazyQCtx := qCtx.Copy()
 			lazyQCtx.SetResponse(nil)
-
 			ctx, cancel := context.WithTimeout(context.Background(), defaultLazyUpdateTimeout)
 			defer cancel()
-
 			if err := executable_seq.ExecChainNode(ctx, lazyQCtx, next); err != nil {
-				c.L().Warn("lazy update failed", zap.Error(err))
+				c.L().Warn("lazy update failed", zap.Error(err), zap.String("key", key))
 				return nil, err
 			}
-
 			if r := lazyQCtx.R(); r != nil {
 				_ = c.store(key, r)
 				c.L().Debug("lazy update success", zap.String("key", key))
@@ -305,24 +334,25 @@ func (c *cachePlugin) store(key string, r *dns.Msg) error {
 		finalPayload = raw
 	}
 
-	bufWrapper := pool.GetBuf(4 + len(finalPayload))
+	bufWrapper := pool.GetBuf(7 + len(finalPayload))
 	defer bufWrapper.Release()
 	if compBuf != nil {
 		defer compBuf.Release()
 	}
 
-	buf := bufWrapper.Bytes()
-	binary.BigEndian.PutUint32(buf[:4], ttl)
-	copy(buf[4:], finalPayload)
+	data := bufWrapper.Bytes()
+	binary.BigEndian.PutUint16(data[0:2], uint16(cacheMagic))
+	data[2] = cacheVersion
+	binary.BigEndian.PutUint32(data[3:7], ttl)
+	copy(data[7:], finalPayload)
 
 	now := time.Now()
-	storageDuration := time.Duration(ttl) * time.Second
+	storageTTL := time.Duration(ttl) * time.Second
 	if c.args.LazyCacheTTL > 0 {
-		storageDuration += time.Duration(c.args.LazyCacheTTL) * time.Second
+		storageTTL += time.Duration(c.args.LazyCacheTTL) * time.Second
 	}
 
-	// Match backend API: Store(key, v, storedTime, expirationTime)
-	c.backend.Store(key, buf, now, now.Add(storageDuration))
+	c.backend.Store(key, data, now, now.Add(storageTTL))
 	return nil
 }
 
