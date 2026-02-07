@@ -94,7 +94,7 @@ func newCachePlugin(bp *coremain.BP, args *Args) (*cachePlugin, error) {
 		backend = mem_cache.NewMemCache(args.Size, 0)
 	}
 
-	// ĐIỂM SỬA 1: Validate tại Init để Hot-path thành Invariant
+	// Sanitize lazy cache configs
 	if args.LazyCacheReplyTTL <= 0 {
 		args.LazyCacheReplyTTL = 5
 	}
@@ -184,17 +184,14 @@ func (c *cachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, nex
 	return nil
 }
 
-// ĐIỂM SỬA 2: Hợp nhất buildKey(), tin tưởng tuyệt đối Mechanism của msg.go
 func (c *cachePlugin) buildKey(q *dns.Msg) (string, error) {
 	if len(q.Question) != 1 {
 		return "", nil
 	}
-
-	// Policy: CacheEverything = ECS-Aware, Else = Shared
+	// Semantic Hashing: ECS-aware vs Shared Cache
 	if c.args.CacheEverything {
 		return dnsutils.GetMsgKey(q, 0)
 	}
-
 	return dnsutils.GetMsgKeyWithTag(q, ""), nil
 }
 
@@ -204,58 +201,49 @@ func (c *cachePlugin) lookup(key string) (msg *dns.Msg, lazy bool, err error) {
 		return nil, false, nil
 	}
 
+	// FAST-PATH: Early reject expired entries based on 7-byte header
 	var ttl uint32
-	var payload []byte
 	isNewFormat := false
+	if len(v) >= 7 && binary.BigEndian.Uint16(v[0:2]) == cacheMagic && v[2] == cacheVersion {
+		ttl = binary.BigEndian.Uint32(v[3:7])
+		elapsed := uint32(time.Since(stored).Seconds())
+		isNewFormat = true
 
-	// Fast-path Header Detection
-	if len(v) >= 7 && binary.BigEndian.Uint16(v[0:2]) == cacheMagic {
-		if v[2] == cacheVersion {
-			ttl = binary.BigEndian.Uint32(v[3:7])
-			payload = v[7:]
-			isNewFormat = true
+		// Reject if elapsed time exceeds total window (Fresh TTL + Lazy TTL)
+		limit := uint64(ttl) + uint64(c.args.LazyCacheTTL)
+		if uint64(elapsed) >= limit {
+			return nil, false, nil
 		}
 	}
 
+	// HEAVY-PATH: Decode & Unpack only if entry is still in valid window
+	var payload []byte
 	if isNewFormat {
-		if len(payload) == 0 {
-			return nil, false, nil
-		}
+		payload = v[7:]
+		if len(payload) == 0 { return nil, false, nil }
 		if c.args.CompressResp {
 			decLen, err := snappy.DecodedLen(payload)
-			if err != nil || decLen <= 0 || decLen > dns.MaxMsgSize {
-				return nil, false, nil
-			}
+			if err != nil || decLen <= 0 { return nil, false, nil }
 			decBuf := pool.GetBuf(decLen)
 			defer decBuf.Release()
 			payload, err = snappy.Decode(decBuf.Bytes()[:0], payload)
-			if err != nil {
-				return nil, false, nil
-			}
+			if err != nil { return nil, false, nil }
 		}
 		msg = new(dns.Msg)
-		if err := msg.Unpack(payload); err != nil {
-			return nil, false, nil
-		}
+		if err := msg.Unpack(payload); err != nil { return nil, false, nil }
 	} else {
 		// Legacy Fallback
 		payload = v
 		if c.args.CompressResp {
 			decLen, err := snappy.DecodedLen(payload)
-			if err != nil || decLen <= 0 || decLen > dns.MaxMsgSize {
-				return nil, false, nil
-			}
+			if err != nil || decLen <= 0 { return nil, false, nil }
 			decBuf := pool.GetBuf(decLen)
 			defer decBuf.Release()
 			payload, err = snappy.Decode(decBuf.Bytes()[:0], payload)
-			if err != nil {
-				return nil, false, nil
-			}
+			if err != nil { return nil, false, nil }
 		}
 		msg = new(dns.Msg)
-		if err := msg.Unpack(payload); err != nil {
-			return nil, false, nil
-		}
+		if err := msg.Unpack(payload); err != nil { return nil, false, nil }
 		if len(msg.Answer) == 0 {
 			ttl = uint32(defaultEmptyAnswerTTL / time.Second)
 		} else {
@@ -266,18 +254,19 @@ func (c *cachePlugin) lookup(key string) (msg *dns.Msg, lazy bool, err error) {
 	now := time.Now()
 	elapsed := uint32(now.Sub(stored).Seconds())
 
+	// Decision point for Fresh vs Lazy vs Miss
 	if elapsed < ttl {
 		dnsutils.SubtractTTL(msg, elapsed)
 		return msg, false, nil
 	}
 
-	// Sử dụng dữ liệu sạch từ Init, toán học uint64 chống tràn
-	if c.args.LazyCacheTTL > 0 && uint64(elapsed) < (uint64(ttl)+uint64(c.args.LazyCacheTTL)) {
-		dnsutils.SetTTL(msg, uint32(c.args.LazyCacheReplyTTL))
-		return msg, true, nil
+	// Strictly enforce LazyCacheTTL = 0 as disabled
+	if c.args.LazyCacheTTL <= 0 {
+		return nil, false, nil
 	}
 
-	return nil, false, nil
+	dnsutils.SetTTL(msg, uint32(c.args.LazyCacheReplyTTL))
+	return msg, true, nil
 }
 
 func (c *cachePlugin) triggerLazyUpdate(key string, qCtx *query_context.Context, next executable_seq.ExecutableChainNode) {
@@ -313,18 +302,13 @@ func (c *cachePlugin) store(key string, r *dns.Msg) error {
 		ttl = dnsutils.GetMinimalTTL(r)
 	}
 
-	if ttl == 0 {
-		return nil
-	}
+	if ttl == 0 { return nil }
 
 	raw, err := r.Pack()
-	if err != nil {
-		return err
-	}
+	if err != nil { return err }
 
 	var finalPayload []byte
 	var compBuf *pool.Buffer
-
 	if c.args.CompressResp {
 		compBuf = pool.GetBuf(snappy.MaxEncodedLen(len(raw)))
 		finalPayload = snappy.Encode(compBuf.Bytes()[:0], raw)
@@ -332,11 +316,10 @@ func (c *cachePlugin) store(key string, r *dns.Msg) error {
 		finalPayload = raw
 	}
 
+	// Header (7B): Magic(2) + Version(1) + TTL(4)
 	bufWrapper := pool.GetBuf(7 + len(finalPayload))
 	defer bufWrapper.Release()
-	if compBuf != nil {
-		defer compBuf.Release()
-	}
+	if compBuf != nil { defer compBuf.Release() }
 
 	data := bufWrapper.Bytes()
 	binary.BigEndian.PutUint16(data[0:2], uint16(cacheMagic))
@@ -345,6 +328,7 @@ func (c *cachePlugin) store(key string, r *dns.Msg) error {
 	copy(data[7:], finalPayload)
 
 	now := time.Now()
+	// storageTTL covers both Fresh and Lazy window
 	storageTTL := time.Duration(ttl) * time.Second
 	if c.args.LazyCacheTTL > 0 {
 		storageTTL += time.Duration(c.args.LazyCacheTTL) * time.Second
