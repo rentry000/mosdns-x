@@ -94,8 +94,12 @@ func newCachePlugin(bp *coremain.BP, args *Args) (*cachePlugin, error) {
 		backend = mem_cache.NewMemCache(args.Size, 0)
 	}
 
+	// ĐIỂM SỬA 1: Validate tại Init để Hot-path thành Invariant
 	if args.LazyCacheReplyTTL <= 0 {
 		args.LazyCacheReplyTTL = 5
+	}
+	if args.LazyCacheTTL < 0 {
+		args.LazyCacheTTL = 0
 	}
 
 	var whenHit executable_seq.Executable
@@ -180,24 +184,18 @@ func (c *cachePlugin) Exec(ctx context.Context, qCtx *query_context.Context, nex
 	return nil
 }
 
+// ĐIỂM SỬA 2: Hợp nhất buildKey(), tin tưởng tuyệt đối Mechanism của msg.go
 func (c *cachePlugin) buildKey(q *dns.Msg) (string, error) {
-	if c.args.CacheEverything {
-		return dnsutils.GetMsgKey(q, 0)
-	}
-
 	if len(q.Question) != 1 {
 		return "", nil
 	}
 
-	// Hot-path: Direct key for simple queries (No struct copy)
-	if len(q.Answer) == 0 && len(q.Ns) == 0 && len(q.Extra) == 0 {
+	// Policy: CacheEverything = ECS-Aware, Else = Shared
+	if c.args.CacheEverything {
 		return dnsutils.GetMsgKey(q, 0)
 	}
 
-	// Normalize key for domain + type only if metadata exists (Copy only when needed)
-	simpleQ := *q
-	simpleQ.Answer, simpleQ.Ns, simpleQ.Extra = nil, nil, nil
-	return dnsutils.GetMsgKey(&simpleQ, 0)
+	return dnsutils.GetMsgKeyWithTag(q, ""), nil
 }
 
 func (c *cachePlugin) lookup(key string) (msg *dns.Msg, lazy bool, err error) {
@@ -210,7 +208,7 @@ func (c *cachePlugin) lookup(key string) (msg *dns.Msg, lazy bool, err error) {
 	var payload []byte
 	isNewFormat := false
 
-	// Format Detection [Magic: 2B][Version: 1B]
+	// Fast-path Header Detection
 	if len(v) >= 7 && binary.BigEndian.Uint16(v[0:2]) == cacheMagic {
 		if v[2] == cacheVersion {
 			ttl = binary.BigEndian.Uint32(v[3:7])
@@ -226,7 +224,7 @@ func (c *cachePlugin) lookup(key string) (msg *dns.Msg, lazy bool, err error) {
 		if c.args.CompressResp {
 			decLen, err := snappy.DecodedLen(payload)
 			if err != nil || decLen <= 0 || decLen > dns.MaxMsgSize {
-				return nil, false, nil // Silent drop/Miss
+				return nil, false, nil
 			}
 			decBuf := pool.GetBuf(decLen)
 			defer decBuf.Release()
@@ -240,7 +238,7 @@ func (c *cachePlugin) lookup(key string) (msg *dns.Msg, lazy bool, err error) {
 			return nil, false, nil
 		}
 	} else {
-		// Legacy Fallback with Decompression support
+		// Legacy Fallback
 		payload = v
 		if c.args.CompressResp {
 			decLen, err := snappy.DecodedLen(payload)
@@ -265,7 +263,6 @@ func (c *cachePlugin) lookup(key string) (msg *dns.Msg, lazy bool, err error) {
 		}
 	}
 
-	// Unified TTL check (Fresh vs Stale)
 	now := time.Now()
 	elapsed := uint32(now.Sub(stored).Seconds())
 
@@ -274,7 +271,8 @@ func (c *cachePlugin) lookup(key string) (msg *dns.Msg, lazy bool, err error) {
 		return msg, false, nil
 	}
 
-	if c.args.LazyCacheTTL > 0 && elapsed < (ttl+uint32(c.args.LazyCacheTTL)) {
+	// Sử dụng dữ liệu sạch từ Init, toán học uint64 chống tràn
+	if c.args.LazyCacheTTL > 0 && uint64(elapsed) < (uint64(ttl)+uint64(c.args.LazyCacheTTL)) {
 		dnsutils.SetTTL(msg, uint32(c.args.LazyCacheReplyTTL))
 		return msg, true, nil
 	}
