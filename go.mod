@@ -1,4 +1,4 @@
-module github.com/rentry000/mosdns-x
+module github.com/pmkol/mosdns-x
 
 go 1.25.5
 
