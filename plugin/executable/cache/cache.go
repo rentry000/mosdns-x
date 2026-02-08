@@ -18,7 +18,6 @@ import (
 	"github.com/pmkol/mosdns-x/pkg/cache/redis_cache"
 	"github.com/pmkol/mosdns-x/pkg/dnsutils"
 	"github.com/pmkol/mosdns-x/pkg/executable_seq"
-	"github.com/pmkol/mosdns-x/pkg/pool"
 	"github.com/pmkol/mosdns-x/pkg/query_context"
 )
 
