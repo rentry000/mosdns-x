@@ -12,6 +12,8 @@ const (
 	defaultCleanerInterval = time.Minute
 )
 
+// MemCache is a simple LRU cache that stores values in memory.
+// It is safe for concurrent use.
 type MemCache struct {
 	closed           uint32
 	closeCleanerChan chan struct{}
@@ -19,11 +21,12 @@ type MemCache struct {
 }
 
 type elem struct {
-	v  []byte // slice header (24B)
-	st int64  // storedTime.Unix() (8B)
-	ex int64  // expirationTime.Unix() (8B) - Bao gồm cả Lazy TTL
+	v  []byte
+	st int64 // storedTime as Unix timestamp
+	ex int64 // expirationTime as Unix timestamp
 }
 
+// NewMemCache initializes a MemCache.
 func NewMemCache(size int, cleanerInterval time.Duration) *MemCache {
 	sizePerShard := size / shardSize
 	if sizePerShard < 16 {
@@ -42,6 +45,7 @@ func (c *MemCache) isClosed() bool {
 	return atomic.LoadUint32(&c.closed) != 0
 }
 
+// Close closes the cache and its cleaner.
 func (c *MemCache) Close() error {
 	if atomic.CompareAndSwapUint32(&c.closed, 0, 1) {
 		close(c.closeCleanerChan)
@@ -57,11 +61,18 @@ func (c *MemCache) Get(key string) (v []byte, storedTime, expirationTime time.Ti
 	if e, ok := c.lru.Get(key); ok {
 		return e.v, time.Unix(e.st, 0), time.Unix(e.ex, 0)
 	}
+
 	return nil, time.Time{}, time.Time{}
 }
 
 func (c *MemCache) Store(key string, v []byte, storedTime, expirationTime time.Time) {
 	if c.isClosed() {
+		return
+	}
+
+	now := time.Now().Unix()
+	ex := expirationTime.Unix()
+	if now > ex {
 		return
 	}
 
@@ -71,7 +82,7 @@ func (c *MemCache) Store(key string, v []byte, storedTime, expirationTime time.T
 	e := &elem{
 		v:  buf,
 		st: storedTime.Unix(),
-		ex: expirationTime.Unix(),
+		ex: ex,
 	}
 	c.lru.Add(key, e)
 }
@@ -87,17 +98,12 @@ func (c *MemCache) startCleaner(interval time.Duration) {
 		case <-c.closeCleanerChan:
 			return
 		case <-ticker.C:
-			c.lru.Clean(c.cleanFunc())
+			now := time.Now().Unix()
+			// Optimized: use inline closure and integer comparison
+			c.lru.Clean(func(_ string, e *elem) bool {
+				return e.ex <= now
+			})
 		}
-	}
-}
-
-func (c *MemCache) cleanFunc() func(_ string, e *elem) bool {
-	// Lấy mốc Unix hiện tại một lần cho mỗi lượt quét
-	nowUnix := time.Now().Unix()
-	return func(_ string, e *elem) bool {
-		// Xóa ngay khi chạm mốc hoặc vượt quá expiration time
-		return e.ex <= nowUnix
 	}
 }
 
