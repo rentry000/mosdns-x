@@ -34,7 +34,7 @@ replace github.com/rentry000/mosdns-x => ./
 replace github.com/nadoo/ipset v0.5.0 => github.com/IrineSistiana/ipset v0.5.1-0.20220703061533-6e0fc3b04c0a
 
 require (
-    github.com/pmkol/mosdns-x
+    github.com/rentry000/mosdns-x
 	github.com/RyuaNerin/go-krypto v1.3.0 // indirect
 	github.com/andybalholm/brotli v1.2.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
