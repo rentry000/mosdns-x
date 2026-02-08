@@ -237,7 +237,7 @@ func (w *whitelist) Exec(ctx context.Context, qCtx *query_context.Context, next 
 	}
 
 	// Get and normalize request path
-	requestPath := normalizePath(qCtx.ReqMeta().GetPath())
+	requestPath := normalizePath(qCtx.ReqMeta().Path)
 
 	// Check path whitelist (path_list and path_ecs both qualify as allowed paths)
 	pathConfigured := len(w.pathList) > 0 || len(w.pathECS) > 0
@@ -328,7 +328,7 @@ func (w *whitelist) addECSForPath(qCtx *query_context.Context, config *pathECSCo
 		dnsutils.AddECS(opt, ecs, true)
 		// Log ECS IP address
 		if addr, ok := netip.AddrFromSlice(ecs.Address); ok {
-			w.L().Debug("added ECS for path", zap.String("path", qCtx.ReqMeta().GetPath()),
+			w.L().Debug("added ECS for path", zap.String("path", qCtx.ReqMeta().Path),
 				zap.Stringer("ecs_ip", addr), zap.Uint8("mask", ecs.SourceNetmask))
 		}
 	}
