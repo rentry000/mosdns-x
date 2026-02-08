@@ -2,7 +2,6 @@ package cache
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"time"
 
@@ -25,8 +24,6 @@ import (
 
 const (
 	PluginType               = "cache"
-	cacheMagic               = 0x4D43 // "MC"
-	cacheVersion             = 0x01
 	defaultLazyUpdateTimeout = 10 * time.Second
 	defaultEmptyAnswerTTL    = 300 * time.Second
 )
@@ -48,9 +45,9 @@ type cachePlugin struct {
 	*coremain.BP
 	args *Args
 
-	whenHit executable_seq.Executable
-	backend cache.Backend
-	sf      singleflight.Group
+	whenHit      executable_seq.Executable
+	backend      cache.Backend
+	sf           singleflight.Group
 
 	queryTotal   prometheus.Counter
 	hitTotal     prometheus.Counter
@@ -172,31 +169,17 @@ func (c *cachePlugin) lookup(key string) (*dns.Msg, bool, error) {
 	v, stored, _ := c.backend.Get(key)
 	if v == nil { return nil, false, nil }
 
-	var ttl uint32
-	var payload []byte
 	elapsed := uint32(time.Since(stored).Seconds())
-
-	// Fast path: Header validation
-	if len(v) >= 7 && binary.BigEndian.Uint16(v[0:2]) == cacheMagic && v[2] == cacheVersion {
-		ttl = binary.BigEndian.Uint32(v[3:7])
-		payload = v[7:]
-		// Reject if age exceeds total allowed lifetime (TTL + Lazy TTL)
-		if uint64(elapsed) >= uint64(ttl)+uint64(c.args.LazyCacheTTL) {
-			return nil, false, nil
-		}
-	} else {
-		payload = v
-	}
 
 	// Decompression
 	var data []byte
 	var err error
-	if c.args.CompressResp && len(payload) > 0 {
-		if data, err = snappy.Decode(nil, payload); err != nil {
+	if c.args.CompressResp && len(v) > 0 {
+		if data, err = snappy.Decode(nil, v); err != nil {
 			return nil, false, err
 		}
 	} else {
-		data = payload
+		data = v
 	}
 
 	msg := new(dns.Msg)
@@ -204,16 +187,16 @@ func (c *cachePlugin) lookup(key string) (*dns.Msg, bool, error) {
 		return nil, false, err
 	}
 
-	// Legacy fallback for entries without binary headers
-	if ttl == 0 {
-		if len(msg.Answer) == 0 {
-			ttl = uint32(defaultEmptyAnswerTTL / time.Second)
-		} else {
-			ttl = dnsutils.GetMinimalTTL(msg)
-		}
-		if uint64(elapsed) >= uint64(ttl)+uint64(c.args.LazyCacheTTL) {
-			return nil, false, nil
-		}
+	var ttl uint32
+	if len(msg.Answer) == 0 {
+		ttl = uint32(defaultEmptyAnswerTTL / time.Second)
+	} else {
+		ttl = dnsutils.GetMinimalTTL(msg)
+	}
+
+	// Reject if age exceeds total allowed lifetime (TTL + Lazy TTL)
+	if uint64(elapsed) >= uint64(ttl)+uint64(c.args.LazyCacheTTL) {
+		return nil, false, nil
 	}
 
 	if elapsed < ttl {
@@ -243,7 +226,7 @@ func (c *cachePlugin) triggerLazyUpdate(key string, qCtx *query_context.Context,
 				c.L().Debug("lazy update success", zap.String("key", key))
 			}
 			
-			cancel() // Manual cleanup after execution
+			cancel() 
 			return nil, nil
 		})
 	}()
@@ -273,22 +256,13 @@ func (c *cachePlugin) store(key string, r *dns.Msg) {
 		raw = snappy.Encode(nil, raw)
 	}
 
-	// Store path: Header(7) + Payload
-	bufWrapper := pool.GetBuf(7 + len(raw))
-	data := bufWrapper.Bytes()
-	binary.BigEndian.PutUint16(data[0:2], cacheMagic)
-	data[2] = cacheVersion
-	binary.BigEndian.PutUint32(data[3:7], ttl)
-	copy(data[7:], raw)
-
 	now := time.Now()
 	storageTTL := time.Duration(ttl) * time.Second
 	if c.args.LazyCacheTTL > 0 {
 		storageTTL += time.Duration(c.args.LazyCacheTTL) * time.Second
 	}
 
-	c.backend.Store(key, data, now, now.Add(storageTTL))
-	bufWrapper.Release() // Immediate manual release
+	c.backend.Store(key, raw, now, now.Add(storageTTL))
 }
 
 func (c *cachePlugin) Shutdown() error {
