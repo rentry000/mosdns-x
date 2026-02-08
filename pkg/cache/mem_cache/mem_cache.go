@@ -27,6 +27,7 @@ type elem struct {
 }
 
 // NewMemCache initializes a MemCache.
+// cleanerInterval <= 0 disables the background cleaner (passive mode).
 func NewMemCache(size int, cleanerInterval time.Duration) *MemCache {
 	sizePerShard := size / shardSize
 	if sizePerShard < 16 {
@@ -37,7 +38,12 @@ func NewMemCache(size int, cleanerInterval time.Duration) *MemCache {
 		closeCleanerChan: make(chan struct{}),
 		lru:              concurrent_lru.NewShardedLRU[*elem](shardSize, sizePerShard, nil),
 	}
-	go c.startCleaner(cleanerInterval)
+	
+	// Optional cleaner
+	if cleanerInterval > 0 {
+		go c.startCleaner(cleanerInterval)
+	}
+	
 	return c
 }
 
@@ -65,26 +71,20 @@ func (c *MemCache) Get(key string) (v []byte, storedTime, expirationTime time.Ti
 	return nil, time.Time{}, time.Time{}
 }
 
+// Store saves an entry. The caller is responsible for TTL validation.
 func (c *MemCache) Store(key string, v []byte, storedTime, expirationTime time.Time) {
 	if c.isClosed() {
-		return
-	}
-
-	now := time.Now().Unix()
-	ex := expirationTime.Unix()
-	if now > ex {
 		return
 	}
 
 	buf := make([]byte, len(v))
 	copy(buf, v)
 
-	e := &elem{
+	c.lru.Add(key, &elem{
 		v:  buf,
 		st: storedTime.Unix(),
-		ex: ex,
-	}
-	c.lru.Add(key, e)
+		ex: expirationTime.Unix(),
+	})
 }
 
 func (c *MemCache) startCleaner(interval time.Duration) {
@@ -99,7 +99,6 @@ func (c *MemCache) startCleaner(interval time.Duration) {
 			return
 		case <-ticker.C:
 			now := time.Now().Unix()
-			// Optimized: use inline closure and integer comparison
 			c.lru.Clean(func(_ string, e *elem) bool {
 				return e.ex <= now
 			})
