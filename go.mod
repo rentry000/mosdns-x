@@ -20,6 +20,10 @@ require (
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
 	github.com/stretchr/testify v1.11.1
+    github.com/vishvananda/netlink v1.2.1-beta.2.0.20221107222636-d3c0a2caa559
+	go.uber.org/zap v1.27.0
+	go4.org/netipx v0.0.0-20231129151722-fdeea329fbba
+	golang.org/x/exp v0.0.0-20250218142911-aa4b98e5adaa
 	gitlab.com/go-extension/http v0.0.0-20260118113043-f91863355c61
 	gitlab.com/go-extension/tls v0.0.0-20260118112212-e13d5f5eea8d
 	go.uber.org/zap v1.27.1
@@ -33,7 +37,6 @@ require (
     github.com/AdguardTeam/dnsproxy v0.75.0
 	github.com/AdguardTeam/golibs v0.32.5
 	github.com/IrineSistiana/go-bytes-pool v0.0.0-20230918115058-c72bd9761c57
-    github.com/AdguardTeam/dnsproxy/upstream
 )
 replace github.com/nadoo/ipset v0.5.0 => github.com/IrineSistiana/ipset v0.5.1-0.20220703061533-6e0fc3b04c0a
 
