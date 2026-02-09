@@ -29,6 +29,10 @@ require (
 	golang.org/x/sys v0.40.0
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
+    github.com/AdguardTeam/dnsproxy/upstream
+	github.com/IrineSistiana/mosdns/v5/coremain
+	github.com/IrineSistiana/mosdns/v5/pkg/query_context
+	github.com/IrineSistiana/mosdns/v5/plugin/executable/sequence
 )
 replace github.com/nadoo/ipset v0.5.0 => github.com/IrineSistiana/ipset v0.5.1-0.20220703061533-6e0fc3b04c0a
 
