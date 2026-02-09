@@ -26,7 +26,7 @@ import (
 	_ "github.com/pmkol/mosdns-x/plugin/executable/bufsize"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/cache"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/client_limiter"
-	_ "github.com/pmkol/mosdns-x/plugin/executable/doh_whitelist"
+	_ "github.com/pmkol/mosdns-x/plugin/executable/dnsproxy"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/dual_selector"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/ecs"
 	_ "github.com/pmkol/mosdns-x/plugin/executable/edns0_filter"
